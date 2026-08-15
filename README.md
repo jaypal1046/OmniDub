@@ -4,6 +4,38 @@ An automated, commercial-grade software engine for turning foreign videos (anime
 
 ---
 
+## 🛠️ Setup & Installation Guide
+
+### Step 1: Prerequisites
+
+1. **Python 3.9+**: Download and install from [python.org](https://www.python.org/downloads/).
+   > ⚠️ **Windows Users**: Ensure you check the box **"Add Python to PATH"** during installation.
+
+2. **FFmpeg**: Essential for video processing and audio time-stretching.
+   - **Windows**: `winget install ffmpeg` (or download from [ffmpeg.org](https://ffmpeg.org))
+   - **macOS**: `brew install ffmpeg`
+   - **Linux**: `sudo apt update && sudo apt install ffmpeg`
+
+### Step 2: Clone Repository & Install Dependencies
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/jaypal1046/OmniDub.git
+cd OmniDub
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+```
+
+### Step 3: Verify Installation
+
+Run the help command to ensure all CLI arguments are recognized:
+```bash
+python app.py --help
+```
+
+---
+
 ## 📁 Dedicated `translated/` Subfolder Architecture
 
 Each project creates a dedicated `translated/` subfolder containing your translated narration text:

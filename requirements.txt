@@ -1,0 +1,10 @@
+# OmniDub AI Dependencies
+yt-dlp>=2024.0.0
+edge-tts>=6.1.0
+pydub>=0.25.1
+whisper-ctranslate2>=0.5.0
+demucs>=4.0.0
+torch
+torchaudio
+requests
+aiohttp
