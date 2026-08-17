@@ -110,6 +110,8 @@ def export_combined_vtt(file_or_dir_path, output_vtt):
 
     return output_vtt
 
+import shutil
+
 def stretch_audio_to_duration(input_path, output_path, target_duration_ms):
     """Speeds up audio clip via FFmpeg atempo filter if longer than scene window."""
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
@@ -128,7 +130,7 @@ def stretch_audio_to_duration(input_path, output_path, target_duration_ms):
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        clip.export(output_path, format="mp3")
+        shutil.copyfile(input_path, output_path)
 
 async def generate_single_tts(entry, voice, temp_dir, semaphore, retries=3):
     """Generate TTS clip asynchronously with retry logic & fallback for edge_tts network glitches."""

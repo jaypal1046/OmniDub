@@ -49,9 +49,9 @@ def get_translated_subtitle_path(project_dir):
 def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 
                           source_lang="Chinese", bgm_volume=0.4, workers=10, 
                           burn_subtitles=False, force=False, pause_after_transcribe=True,
-                          auto_continue=False):
+                          auto_continue=False, model="medium", device=None, mode=1):
     """
-    State-managed master controller for the AI Recap pipeline.
+    State-managed master controller for the AI Recap pipeline with GPU acceleration & 4 output merge modes.
     """
     # 1. Resolve project name & directory
     if not project_name or project_name == "my_recap_project":
@@ -88,7 +88,7 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     if state_mgr.is_step_completed("transcribe", [orig_sub_path]):
         print(f"\n⏩ [2/5] Step 'transcribe' already COMPLETED (cached). Skipping.")
     else:
-        orig_sub_path, _ = transcribe_media(audio_path, project_dir, source_lang=source_lang)
+        orig_sub_path, _ = transcribe_media(audio_path, project_dir, source_lang=source_lang, model=model, device=device)
         state_mgr.mark_step_completed("transcribe", [orig_sub_path])
         transcribe_just_completed = True
 
@@ -96,7 +96,7 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     if state_mgr.is_step_completed("separate_bgm", [bgm_path]):
         print(f"\n⏩ [3/5] Step 'separate_bgm' already COMPLETED (cached). Skipping.")
     else:
-        bgm_path = separate_bgm(audio_path, project_dir)
+        bgm_path = separate_bgm(audio_path, project_dir, device=device)
         state_mgr.mark_step_completed("separate_bgm", [bgm_path])
 
     # PAUSE FOR SUBTITLE TRANSLATION CHECK
@@ -133,7 +133,7 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     else:
         final_video_path = merge_project_video(
             video_path, voiceover_path, bgm_path, project_dir,
-            sub_path=active_sub_path, bgm_volume=bgm_volume, burn_subtitles=burn_subtitles
+            sub_path=active_sub_path, bgm_volume=bgm_volume, burn_subtitles=burn_subtitles, mode=mode
         )
         state_mgr.mark_step_completed("merge_video", [final_video_path])
         state_mgr.set_project_status("COMPLETED")
@@ -151,8 +151,12 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--voice", default="en-US-GuyNeural", help="Edge-TTS narrator voice name")
     parser.add_argument("-l", "--lang", default="Chinese", help="Source video language")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of parallel TTS workers")
+    parser.add_argument("-m", "--model", default="medium", help="Whisper model name (e.g. medium, large-v3-turbo, small)")
+    parser.add_argument("-d", "--device", default=None, help="Device to use for AI inference ('cuda' or 'cpu')")
+    parser.add_argument("-mode", "--mode", type=int, choices=[1, 2, 3, 4], default=1,
+                        help="Output mode: 1=Video+Audio (DEFAULT), 2=Video+Audio+BGM, 3=Video+Audio+Transcript, 4=Video+Audio+BGM+Transcript")
     parser.add_argument("--bgm-volume", type=float, default=0.4, help="BGM volume multiplier (0.0 to 1.0)")
-    parser.add_argument("--burn-subtitles", action="store_true", help="Burn subtitles onto the final video")
+    parser.add_argument("--burn-subtitles", action="store_true", help="Burn subtitles onto the final video (maps to Mode 3/4)")
     parser.add_argument("--force", action="store_true", help="Force re-run all steps without using cached state")
     parser.add_argument("--no-pause", dest="pause_after_transcribe", action="store_false", help="Do not pause for translation")
     parser.add_argument("--auto-continue", action="store_true", help="Automatically continue to voiceover generation")
@@ -169,5 +173,8 @@ if __name__ == "__main__":
         burn_subtitles=args.burn_subtitles,
         force=args.force,
         pause_after_transcribe=args.pause_after_transcribe,
-        auto_continue=args.auto_continue
+        auto_continue=args.auto_continue,
+        model=args.model,
+        device=args.device,
+        mode=args.mode
     )

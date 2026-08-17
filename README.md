@@ -74,13 +74,48 @@ python app.py "https://www.youtube.com/watch?v=t95pOwN8NFY" -name anime_ep1 --au
 
 ---
 
-## 💻 CLI Options
+## 🎬 4 Video Output Modes (`-mode`)
+
+OmniDub AI supports 4 output modes for assembling your final recap video:
+
+| Mode | Option | Video Track | Audio Track | Subtitles / Transcript | Speed | Example Command |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`-mode 1`** | **Video + Audio (DEFAULT)** | Muted Original Video | TTS Synced Voiceover | None | ⚡ **Instant (~5s)** | `python app.py "URL" -name ep1 --auto-continue` |
+| **`-mode 2`** | **Video + Audio + BGM** | Muted Original Video | TTS Voiceover + Isolated BGM | None | ⚡ **Instant (~5s)** | `python app.py "URL" -name ep1 -mode 2 --auto-continue` |
+| **`-mode 3`** | **Video + Audio + Transcript** | Muted Original Video | TTS Synced Voiceover | Burned Subtitles | 🐢 CPU Software Encode | `python app.py "URL" -name ep1 -mode 3 --auto-continue` |
+| **`-mode 4`** | **Video + Audio + BGM + Transcript** | Muted Original Video | TTS Voiceover + Isolated BGM | Burned Subtitles | 🐢 CPU Software Encode | `python app.py "URL" -name ep1 -mode 4 --auto-continue` |
+
+---
+
+## ⚡ Parallel Per-File TTS Generation (`generate_tts_chunks.py`)
+
+When you split large subtitle files into multiple `.vtt` chunks inside `Translated/` (e.g., `1_audio_txt.vtt`, `2_audio.txt.vtt`...):
+
+```bash
+# Process all translated VTT files in parallel and stitch into master voiceover
+python generate_tts_chunks.py output/anime_ep1/Translated --stitch
+```
+
+* **What it does**:
+  1. Runs parallel worker threads across all split `.vtt` files in `Translated/`.
+  2. Generates **1-to-1 matching audio files** (`1_audio_txt.mp3`, `2_audio.txt.mp3`, etc.) with zero per-dialogue file clutter on disk.
+  3. Stitches all audio files into `synced_voiceover.mp3` ready for video assembly!
+
+---
+
+## 💻 CLI Options Reference
 
 | Goal | Command |
 | :--- | :--- |
 | **Run Initial Processing** | `python app.py "https://..." -name project1` |
-| **Resume After Editing `translated/audio.vtt`** | `python app.py "https://..." -name project1 --auto-continue` |
+| **Default Fast Merge (Video + Audio)** | `python app.py "https://..." -name project1 --auto-continue` |
+| **Merge Video + Audio + BGM Music** | `python app.py "https://..." -name project1 -mode 2 --auto-continue` |
+| **Merge Video + Audio + Burned Transcript** | `python app.py "https://..." -name project1 -mode 3 --auto-continue` |
+| **Merge Video + Audio + BGM + Burned Transcript** | `python app.py "https://..." -name project1 -mode 4 --auto-continue` |
+| **Set TTS Concurrency Workers** | `python app.py "https://..." -w 10` |
+| **Set Whisper AI Model** | `python app.py "https://..." -m large-v3-turbo` |
+| **Set AI Hardware Device** | `python app.py "https://..." -d cuda` |
 | **Force Re-Run (Bypass Cache)** | `python app.py "https://..." --force` |
 | **Choose Narrator Voice** | `python app.py "https://..." -v en-US-ChristopherNeural` |
-| **Burn Subtitles onto Video** | `python app.py "https://..." --burn-subtitles` |
-| **List Available Narrator Voices** | `python list_sample_voices.py` |
+| **Generate Chunks Per Translated VTT File** | `python generate_tts_chunks.py output/project1/Translated --stitch` |
+

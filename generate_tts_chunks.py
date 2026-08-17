@@ -17,6 +17,8 @@ import sys
 import asyncio
 import argparse
 import subprocess
+import shutil
+import tempfile
 from pydub import AudioSegment
 import edge_tts
 
@@ -114,32 +116,36 @@ def parse_subtitles(file_or_dir_path):
 
     return all_entries
 
-def stretch_audio_to_duration(input_path, output_path, target_duration_ms):
+async def async_stretch_audio_to_duration(input_path, output_path, target_duration_ms):
     """
     Adjusts audio playback speed via FFmpeg atempo filter if clip duration
-    exceeds target scene window. Otherwise exports clip directly.
+    exceeds target scene window. Non-blocking & fast copy fallback.
     """
     if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
-        AudioSegment.silent(duration=max(target_duration_ms, 500)).export(output_path, format="mp3")
+        await asyncio.to_thread(
+            lambda: AudioSegment.silent(duration=max(target_duration_ms, 500)).export(output_path, format="mp3")
+        )
         return
 
-    clip = AudioSegment.from_file(input_path)
+    clip = await asyncio.to_thread(AudioSegment.from_file, input_path)
     actual_duration_ms = len(clip)
 
     if actual_duration_ms > target_duration_ms and target_duration_ms > 200:
         speed_ratio = min(actual_duration_ms / target_duration_ms, 2.0)
-        cmd = [
+        proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", input_path,
             "-filter:a", f"atempo={speed_ratio:.4f}",
-            output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            output_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        await proc.communicate()
     else:
-        clip.export(output_path, format="mp3")
+        await asyncio.to_thread(shutil.copyfile, input_path, output_path)
 
 async def generate_single_chunk_tts(entry, voice, output_dir, semaphore, retries=3, force=False):
     """
-    Generates TTS for a single subtitle chunk with retry logic and caching.
+    Generates TTS for a single subtitle chunk with retry logic, caching, and non-blocking audio processing.
     """
     async with semaphore:
         chunk_file = entry["chunk_filename"]
@@ -149,7 +155,7 @@ async def generate_single_chunk_tts(entry, voice, output_dir, semaphore, retries
         # Check caching
         if not force and os.path.exists(final_chunk_path) and os.path.getsize(final_chunk_path) > 0:
             try:
-                clip = AudioSegment.from_file(final_chunk_path)
+                clip = await asyncio.to_thread(AudioSegment.from_file, final_chunk_path)
                 entry["audio_duration_ms"] = len(clip)
                 entry["status"] = "COMPLETED"
                 entry["audio_path"] = final_chunk_path
@@ -176,14 +182,14 @@ async def generate_single_chunk_tts(entry, voice, output_dir, semaphore, retries
                     await asyncio.sleep(0.5 * attempt)
 
         if success:
-            stretch_audio_to_duration(raw_clip_path, final_chunk_path, entry['duration_ms'])
+            await async_stretch_audio_to_duration(raw_clip_path, final_chunk_path, entry['duration_ms'])
             if os.path.exists(raw_clip_path):
                 try:
                     os.remove(raw_clip_path)
                 except OSError:
                     pass
 
-            clip = AudioSegment.from_file(final_chunk_path)
+            clip = await asyncio.to_thread(AudioSegment.from_file, final_chunk_path)
             entry["audio_duration_ms"] = len(clip)
             entry["status"] = "COMPLETED"
             entry["audio_path"] = final_chunk_path
@@ -260,28 +266,28 @@ def save_manifests(entries, output_dir):
 def stitch_chunks_to_master(entries, output_audio_path):
     """
     Stitches individual chunk audio clips into a single master audio track
-    synced to exact VTT cue timestamps.
+    synced to exact VTT cue timestamps. Optimized with single-allocation master timeline.
     """
     print(f"\n🧩 Stitching {len(entries)} audio chunks into master audio file...")
-    master_audio = AudioSegment.silent(duration=0)
+    
+    valid_entries = [
+        e for e in entries 
+        if e.get("audio_path") and os.path.exists(e["audio_path"]) and os.path.getsize(e["audio_path"]) > 0
+    ]
+    if not valid_entries:
+        print("Warning: No valid audio chunks found to stitch.")
+        return output_audio_path
+
+    # Preallocate master audio segment to avoid O(N^2) memory reallocation & re-copying
+    max_duration_ms = max(e["start_ms"] + e.get("audio_duration_ms", 5000) for e in valid_entries) + 1000
+    master_audio = AudioSegment.silent(duration=max_duration_ms)
 
     success_count = 0
-    for entry in entries:
-        clip_path = entry.get("audio_path")
-        if not clip_path or not os.path.exists(clip_path) or os.path.getsize(clip_path) == 0:
-            continue
-
+    for entry in valid_entries:
         try:
+            clip_path = entry["audio_path"]
             clip = AudioSegment.from_file(clip_path)
-            start_ms = entry["start_ms"]
-            clip_len = len(clip)
-
-            needed_duration = start_ms + clip_len
-            if len(master_audio) < needed_duration:
-                silence_needed = needed_duration - len(master_audio)
-                master_audio += AudioSegment.silent(duration=silence_needed)
-
-            master_audio = master_audio.overlay(clip, position=start_ms)
+            master_audio = master_audio.overlay(clip, position=entry["start_ms"])
             success_count += 1
         except Exception as e:
             print(f"Warning: Failed to overlay chunk {entry.get('chunk_filename')}: {e}")
@@ -292,10 +298,117 @@ def stitch_chunks_to_master(entries, output_audio_path):
     print(f"🎉 Master synced voiceover ({total_sec:.2f}s) exported to: {output_audio_path}")
     return output_audio_path
 
+async def process_sub_file_to_audio_async(sub_file_path, voice, output_mp3_path, cue_semaphore, force=False):
+    """
+    Synthesizes all cues for a single VTT/SRT file directly in memory/temp buffer
+    and exports EXACTLY ONE matching MP3 audio file. No per-cue MP3s are left on disk!
+    """
+    base_name = os.path.basename(sub_file_path)
+
+    if not force and os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 0:
+        entries = parse_single_sub_file(sub_file_path)
+        min_start = min(e["start_ms"] for e in entries) if entries else 0
+        print(f"⏩ [File Worker] '{base_name}' already COMPLETED (cached). Skipping.")
+        return output_mp3_path, min_start, entries
+
+    entries = parse_single_sub_file(sub_file_path)
+    if not entries:
+        return output_mp3_path, 0, []
+
+    print(f"🎙️ [File Worker] Processing '{base_name}' ({len(entries)} cues)...")
+
+    min_start = min(e["start_ms"] for e in entries)
+    max_end = max(e["end_ms"] for e in entries)
+    file_duration_ms = max(max_end - min_start + 1000, 1000)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        async def fetch_cue(idx, entry):
+            async with cue_semaphore:
+                raw_clip_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
+                adj_clip_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
+                try:
+                    comm = edge_tts.Communicate(entry["text"], voice)
+                    await comm.save(raw_clip_path)
+                    if os.path.exists(raw_clip_path) and os.path.getsize(raw_clip_path) > 0:
+                        clip = await asyncio.to_thread(AudioSegment.from_file, raw_clip_path)
+                        if len(clip) > entry["duration_ms"] and entry["duration_ms"] > 200:
+                            speed_ratio = min(len(clip) / entry["duration_ms"], 2.0)
+                            proc = await asyncio.create_subprocess_exec(
+                                "ffmpeg", "-y", "-i", raw_clip_path,
+                                "-filter:a", f"atempo={speed_ratio:.4f}",
+                                adj_clip_path,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL
+                            )
+                            await proc.communicate()
+                            if os.path.exists(adj_clip_path):
+                                res_clip = await asyncio.to_thread(AudioSegment.from_file, adj_clip_path)
+                                return entry["start_ms"], res_clip
+                        return entry["start_ms"], clip
+                except Exception as e:
+                    print(f"Warning: TTS failed for cue '{entry['text'][:20]}...': {e}")
+                return entry["start_ms"], AudioSegment.silent(duration=max(entry["duration_ms"], 500))
+
+        tasks = [fetch_cue(i, entry) for i, entry in enumerate(entries, 1)]
+        cue_results = await asyncio.gather(*tasks)
+
+        # Assemble single audio track for this subtitle file
+        file_audio = AudioSegment.silent(duration=file_duration_ms)
+        for abs_start_ms, clip in cue_results:
+            rel_pos = abs_start_ms - min_start
+            file_audio = file_audio.overlay(clip, position=rel_pos)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_mp3_path)), exist_ok=True)
+        await asyncio.to_thread(file_audio.export, output_mp3_path, format="mp3")
+        print(f"  └─ 🎵 Exported '{os.path.basename(output_mp3_path)}' ({len(entries)} cues, {len(file_audio)/1000.0:.1f}s)")
+        return output_mp3_path, min_start, entries
+
+async def generate_file_level_tts_parallel(sub_files, voice, output_dir, max_workers=10, force=False):
+    """
+    Multiprocessing engine that generates 1 matching MP3 file per input VTT file in parallel.
+    NO per-cue chunk files are created on disk!
+    """
+    cue_semaphore = asyncio.Semaphore(max_workers)
+    
+    file_tasks = []
+    for sf in sub_files:
+        base_name = os.path.splitext(os.path.basename(sf))[0]
+        out_mp3 = os.path.join(output_dir, f"{base_name}.mp3")
+        file_tasks.append(process_sub_file_to_audio_async(sf, voice, out_mp3, cue_semaphore, force=force))
+
+    file_results = await asyncio.gather(*file_tasks)
+    return file_results
+
+def stitch_file_mp3s_to_master(file_results, output_audio_path):
+    """Stitches the per-file MP3 outputs into the single master voiceover track."""
+    print(f"\n🧩 Stitching {len(file_results)} per-file MP3 outputs into master voiceover...")
+    valid_results = [r for r in file_results if r[0] and os.path.exists(r[0])]
+    if not valid_results:
+        return output_audio_path
+
+    # Determine total master duration
+    max_end_ms = 0
+    for mp3_path, min_start, entries in valid_results:
+        clip = AudioSegment.from_file(mp3_path)
+        end_ms = min_start + len(clip)
+        if end_ms > max_end_ms:
+            max_end_ms = end_ms
+
+    master_audio = AudioSegment.silent(duration=max_end_ms + 1000)
+    for mp3_path, min_start, _ in valid_results:
+        clip = AudioSegment.from_file(mp3_path)
+        master_audio = master_audio.overlay(clip, position=min_start)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_audio_path)), exist_ok=True)
+    master_audio.export(output_audio_path, format="mp3")
+    print(f"🎉 Master synced voiceover ({len(master_audio)/1000.0:.2f}s) exported to: {output_audio_path}")
+    return output_audio_path
+
 def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural", 
                            workers=10, retries=3, force=False, stitch=False, master_output=None):
     """
-    Main entry point for chunked TTS generation.
+    Main entry point for parallel file-level TTS generation.
+    Outputs exactly 1 matching audio file per translated subtitle file.
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
@@ -310,7 +423,7 @@ def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural",
     os.makedirs(output_dir, exist_ok=True)
 
     print("=====================================================================")
-    print("        CHUNKED VTT TEXT-TO-SPEECH (TTS) GENERATION ENGINE          ")
+    print("      PARALLEL PER-FILE VTT TEXT-TO-SPEECH (TTS) ENGINE             ")
     print("=====================================================================")
     print(f"Subtitle Input: {os.path.abspath(input_path)}")
     print(f"Output Folder:  {os.path.abspath(output_dir)}")
@@ -318,50 +431,38 @@ def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural",
     print(f"Concurrency:    {workers} parallel workers")
     print("=====================================================================\n")
 
-    # 1. Parse Subtitles
-    entries = parse_subtitles(input_path)
-    if not entries:
-        print("❌ Error: No subtitle cues found!")
-        return output_dir, None
+    master_path = master_output or os.path.join(os.path.dirname(output_dir), "synced_voiceover.mp3")
 
-    print(f"Parsed {len(entries)} timestamped subtitle cues across input.\n")
+    if os.path.isdir(input_path):
+        sub_files = [
+            os.path.join(input_path, f) for f in os.listdir(input_path)
+            if f.lower().endswith((".vtt", ".srt"))
+        ]
+        sub_files.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', os.path.basename(x))])
 
-    # 2. Run Parallel Generator with Caching & Retries
-    cached_c, gen_c, fail_c = asyncio.run(
-        generate_chunks_parallel(entries, voice, output_dir, max_workers=workers, retries=retries, force=force)
-    )
+        print(f"Detected {len(sub_files)} translated subtitle files. Processing 1-to-1 matching audio files in parallel...\n")
 
-    print(f"\n---------------------------------------------------------------------")
-    print(f"CHUNK GENERATION SUMMARY:")
-    print(f"  ├─ Total Cues:      {len(entries)}")
-    print(f"  ├─ Cached (Skipped):{cached_c}")
-    print(f"  ├─ Newly Generated: {gen_c}")
-    print(f"  └─ Failed Chunks:   {fail_c}")
-    print(f"---------------------------------------------------------------------\n")
-
-    # 3. Export Manifests
-    save_manifests(entries, output_dir)
-
-    # 4. Optional Master Stitching
-    master_path = None
-    if stitch or master_output:
-        if not master_output:
-            master_path = os.path.join(os.path.dirname(output_dir), "synced_voiceover.mp3")
-        else:
-            master_path = master_output
-        master_path = stitch_chunks_to_master(entries, master_path)
+        file_results = asyncio.run(
+            generate_file_level_tts_parallel(sub_files, voice, output_dir, max_workers=workers, force=force)
+        )
+        master_path = stitch_file_mp3s_to_master(file_results, master_path)
+    else:
+        out_mp3 = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}.mp3")
+        cue_semaphore = asyncio.Semaphore(workers)
+        _, _, _ = asyncio.run(process_sub_file_to_audio_async(input_path, voice, out_mp3, cue_semaphore, force=force))
+        shutil.copyfile(out_mp3, master_path)
 
     return output_dir, master_path
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Chunked VTT/SRT Text-to-Speech (TTS) Engine with Caching & Manifest Logging")
+    parser = argparse.ArgumentParser(description="Parallel Per-File VTT Text-to-Speech (TTS) Engine")
     parser.add_argument("input_path", help="Path to .vtt/.srt subtitle file OR folder of split subtitles (e.g. Translated/)")
-    parser.add_argument("-o", "--output-dir", help="Directory to save generated audio chunks and manifests (default: <input>/tts_chunks)")
+    parser.add_argument("-o", "--output-dir", help="Directory to save generated audio files (default: <input>/tts_chunks)")
     parser.add_argument("-v", "--voice", default="en-US-GuyNeural", help="Edge-TTS voice (default: en-US-GuyNeural)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Parallel worker concurrency (default: 10)")
     parser.add_argument("-r", "--retries", type=int, default=3, help="Max retries per chunk on failure (default: 3)")
-    parser.add_argument("--force", action="store_true", help="Force re-generating all chunks ignoring cache")
-    parser.add_argument("--stitch", action="store_true", help="Stitch audio chunks into master synced voiceover file after generation")
+    parser.add_argument("--force", action="store_true", help="Force re-generating all files ignoring cache")
+    parser.add_argument("--stitch", action="store_true", help="Stitch audio files into master synced voiceover file after generation")
     parser.add_argument("--master-output", help="Custom output filepath for stitched master audio")
 
     args = parser.parse_args()

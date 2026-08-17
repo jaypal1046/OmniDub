@@ -1,16 +1,23 @@
 import os
+import time
 import concurrent.futures
+import threading
+
+# Global GPU Semaphore to limit concurrent VRAM/heavy GPU tasks when running batch projects
+GPU_SEMAPHORE = threading.BoundedSemaphore(value=2)
 
 def run_batch_pipeline(tasks, worker_count=4, process_func=None):
     """
-    Executes multiple VoxSync AI video processing tasks in parallel using a ThreadPoolExecutor.
+    Executes multiple OmniDub AI video processing tasks in parallel using an optimized ThreadPoolExecutor.
     `tasks` is a list of dictionaries containing keyword arguments for `process_func`.
     """
     if process_func is None:
         raise ValueError("process_func must be provided for batch execution.")
 
+    start_time = time.time()
+
     print("=========================================================================")
-    print(f"       VOXSYNC AI - PARALLEL BATCH PROCESSING ENGINE ({len(tasks)} Tasks)")
+    print(f"       OMNIDUB AI - ACCELERATED BATCH PROCESSING ENGINE ({len(tasks)} Tasks)")
     print(f"       Worker Pool Size: {worker_count} parallel project runners")
     print("=========================================================================\n")
 
@@ -30,5 +37,10 @@ def run_batch_pipeline(tasks, worker_count=4, process_func=None):
             except Exception as e:
                 results[task_id] = {"status": "FAILED", "error": str(e)}
                 print(f"❌ [Batch Worker] Task '{task_id}' FAILED: {e}")
+
+    total_duration = time.time() - start_time
+    print("\n=========================================================================")
+    print(f"📊 BATCH EXECUTION FINISHED IN {total_duration:.2f} seconds across {len(tasks)} tasks.")
+    print("=========================================================================\n")
 
     return results

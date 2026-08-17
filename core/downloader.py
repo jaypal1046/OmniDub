@@ -22,23 +22,47 @@ def download_media(source_url_or_path, project_dir):
         elif os.path.exists(os.path.join(project_dir, "cookies.txt")):
             cookies_arg = ["--cookies", os.path.join(project_dir, "cookies.txt")]
 
+        def _cleanup_part_files():
+            if os.path.exists(project_dir):
+                for f in os.listdir(project_dir):
+                    if f.endswith(".part"):
+                        try:
+                            os.remove(os.path.join(project_dir, f))
+                        except Exception:
+                            pass
+
+        _cleanup_part_files()
+
+        # JS challenge solver flags to handle YouTube n-challenge and prevent 403 Forbidden errors
+        js_solver_args = ["--remote-components", "ejs:github", "--js-runtimes", "deno"]
+        format_spec = "bv*[height<=1080]+ba/b[height<=1080]/bestvideo+bestaudio/best"
+
+        # Try clean download without cookies first (avoids invalid session/cookie 403 errors)
         cmd_video = [
             "yt-dlp", "-o", video_path,
-            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/mp4/best"
-        ] + cookies_arg + [source_url_or_path]
-
-        cmd_audio = [
-            "yt-dlp", "-o", audio_path,
-            "-x", "--audio-format", "mp3"
-        ] + cookies_arg + [source_url_or_path]
+            "-f", format_spec,
+            "--merge-output-format", "mp4"
+        ] + js_solver_args + [source_url_or_path]
 
         try:
             subprocess.run(cmd_video, check=True)
         except subprocess.CalledProcessError:
-            # Fallback for protected video sites (e.g. Douyin / protected streams)
-            print("Primary download format failed. Trying fallback format selection...")
-            fallback_cmd = ["yt-dlp", "-o", video_path] + cookies_arg + [source_url_or_path]
-            subprocess.run(fallback_cmd, check=True)
+            print("Primary download failed. Cleaning partial files and trying fallback options...")
+            _cleanup_part_files()
+            # Fallback 1: Try with cookies if cookies.txt exists and --no-continue
+            fallback_cmd = [
+                "yt-dlp", "-o", video_path,
+                "-f", format_spec,
+                "--merge-output-format", "mp4",
+                "--no-continue"
+            ] + js_solver_args + cookies_arg + [source_url_or_path]
+            try:
+                subprocess.run(fallback_cmd, check=True)
+            except subprocess.CalledProcessError:
+                print("Fallback 1 failed. Trying basic yt-dlp download...")
+                _cleanup_part_files()
+                fallback_cmd2 = ["yt-dlp", "-o", video_path, "--no-continue"] + js_solver_args + [source_url_or_path]
+                subprocess.run(fallback_cmd2, check=True)
 
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             print(f"[1/5] Extracting Audio from Downloaded Video to: {audio_path}")
