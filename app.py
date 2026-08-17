@@ -49,7 +49,8 @@ def get_translated_subtitle_path(project_dir):
 def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 
                           source_lang="Chinese", bgm_volume=0.4, workers=10, 
                           burn_subtitles=False, force=False, pause_after_transcribe=True,
-                          auto_continue=False, model="medium", device=None, mode=1):
+                          auto_continue=False, model="medium", device=None, mode=1,
+                          compute_type=None, vad_filter=True, batched=True, threads=None):
     """
     State-managed master controller for the AI Recap pipeline with GPU acceleration & 4 output merge modes.
     """
@@ -88,7 +89,10 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     if state_mgr.is_step_completed("transcribe", [orig_sub_path]):
         print(f"\n⏩ [2/5] Step 'transcribe' already COMPLETED (cached). Skipping.")
     else:
-        orig_sub_path, _ = transcribe_media(audio_path, project_dir, source_lang=source_lang, model=model, device=device)
+        orig_sub_path, _ = transcribe_media(
+            audio_path, project_dir, source_lang=source_lang, model=model, device=device,
+            compute_type=compute_type, vad_filter=vad_filter, batched=batched, threads=threads
+        )
         state_mgr.mark_step_completed("transcribe", [orig_sub_path])
         transcribe_just_completed = True
 
@@ -153,6 +157,10 @@ if __name__ == "__main__":
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of parallel TTS workers")
     parser.add_argument("-m", "--model", default="medium", help="Whisper model name (e.g. medium, large-v3-turbo, small)")
     parser.add_argument("-d", "--device", default=None, help="Device to use for AI inference ('cuda' or 'cpu')")
+    parser.add_argument("--compute-type", default=None, help="Quantization type (e.g. int8, float16)")
+    parser.add_argument("--no-vad", dest="vad_filter", action="store_false", help="Disable VAD silence filtering")
+    parser.add_argument("--no-batched", dest="batched", action="store_false", help="Disable batched decoding")
+    parser.add_argument("-t", "--threads", type=int, default=None, help="Number of threads for CPU inference")
     parser.add_argument("-mode", "--mode", type=int, choices=[1, 2, 3, 4], default=1,
                         help="Output mode: 1=Video+Audio (DEFAULT), 2=Video+Audio+BGM, 3=Video+Audio+Transcript, 4=Video+Audio+BGM+Transcript")
     parser.add_argument("--bgm-volume", type=float, default=0.4, help="BGM volume multiplier (0.0 to 1.0)")
@@ -176,5 +184,9 @@ if __name__ == "__main__":
         auto_continue=args.auto_continue,
         model=args.model,
         device=args.device,
-        mode=args.mode
+        mode=args.mode,
+        compute_type=args.compute_type,
+        vad_filter=args.vad_filter,
+        batched=args.batched,
+        threads=args.threads
     )

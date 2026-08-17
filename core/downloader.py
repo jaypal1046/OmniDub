@@ -13,6 +13,17 @@ def download_media(source_url_or_path, project_dir):
     audio_path = os.path.join(project_dir, "audio.mp3")
 
     if source_url_or_path.startswith("http://") or source_url_or_path.startswith("https://"):
+        # Check if video.mp4 & audio.mp3 already exist in project_dir
+        if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+            print(f"\n⏩ [1/5] Reusing existing video file at: {video_path}")
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                print(f"[1/5] Extracting Audio from Video to: {audio_path}")
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vn", "-acodec", "libmp3lame", audio_path
+                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return video_path, audio_path
+
         print(f"\n[1/5] Downloading Online Video to: {video_path}")
         
         # Check if cookies.txt exists in root or project_dir

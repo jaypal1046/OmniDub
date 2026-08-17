@@ -2,33 +2,20 @@ import os
 import shutil
 import subprocess
 
-def is_cuda_available():
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-def transcribe_media(audio_path, project_dir, source_lang="Chinese", model="medium", device=None):
+def transcribe_media(audio_path, project_dir, source_lang="Chinese", model="medium", **kwargs):
     """
     Transcribes audio using faster-whisper into project_dir.
-    Auto-detects CUDA GPU for 5-10x performance boost.
+    Creates original transcript (project_dir/audio.vtt) and template inside
+    translated/ subfolder (project_dir/translated/audio.vtt).
+    Returns (original_sub_path, translated_sub_path).
     """
     print(f"\n[2/5] Transcribing Audio ({source_lang}) to Subtitles...")
-    cmd = [
+    subprocess.run([
         "whisper-ctranslate2", audio_path,
         "--output_dir", project_dir,
         "--language", source_lang,
         "--model", model
-    ]
-
-    if device == "cuda" or (device is None and is_cuda_available()):
-        print("⚡ CUDA GPU detected! Accelerating Whisper with device=cuda & compute_type=float16")
-        cmd.extend(["--device", "cuda", "--compute_type", "float16"])
-    else:
-        print("ℹ️ Running Whisper on CPU (Multi-threaded)")
-
-    subprocess.run(cmd, check=True)
+    ], check=True)
 
     base_name = os.path.splitext(os.path.basename(audio_path))[0]
     raw_vtt = os.path.join(project_dir, f"{base_name}.vtt")
