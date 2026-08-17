@@ -278,8 +278,19 @@ def stitch_chunks_to_master(entries, output_audio_path):
         print("Warning: No valid audio chunks found to stitch.")
         return output_audio_path
 
-    # Preallocate master audio segment to avoid O(N^2) memory reallocation & re-copying
+    # Preallocate master audio segment matching subtitle timestamps or reference original audio duration
     max_duration_ms = max(e["start_ms"] + e.get("audio_duration_ms", 5000) for e in valid_entries) + 1000
+
+    # Match exact video/audio duration if audio.mp3 is available in project folder
+    project_dir = os.path.dirname(os.path.abspath(output_audio_path))
+    ref_audio = os.path.join(project_dir, "audio.mp3")
+    if os.path.exists(ref_audio) and os.path.getsize(ref_audio) > 0:
+        try:
+            ref_clip = AudioSegment.from_file(ref_audio)
+            max_duration_ms = max(max_duration_ms, len(ref_clip))
+        except Exception:
+            pass
+
     master_audio = AudioSegment.silent(duration=max_duration_ms)
 
     success_count = 0
@@ -405,10 +416,10 @@ def stitch_file_mp3s_to_master(file_results, output_audio_path):
     return output_audio_path
 
 def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural", 
-                           workers=10, retries=3, force=False, stitch=False, master_output=None):
+                           workers=10, retries=5, force=False, stitch=True, master_output=None):
     """
-    Main entry point for parallel file-level TTS generation.
-    Outputs exactly 1 matching audio file per translated subtitle file.
+    Main entry point for parallel VTT Text-to-Speech (TTS) generation with persistent chunk caching.
+    Supports single VTT file or folder of split VTT files.
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
@@ -423,7 +434,7 @@ def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural",
     os.makedirs(output_dir, exist_ok=True)
 
     print("=====================================================================")
-    print("      PARALLEL PER-FILE VTT TEXT-TO-SPEECH (TTS) ENGINE             ")
+    print("      PARALLEL VTT TEXT-TO-SPEECH (TTS) GENERATOR                   ")
     print("=====================================================================")
     print(f"Subtitle Input: {os.path.abspath(input_path)}")
     print(f"Output Folder:  {os.path.abspath(output_dir)}")
@@ -433,24 +444,21 @@ def process_vtt_tts_chunks(input_path, output_dir=None, voice="en-US-GuyNeural",
 
     master_path = master_output or os.path.join(os.path.dirname(output_dir), "synced_voiceover.mp3")
 
-    if os.path.isdir(input_path):
-        sub_files = [
-            os.path.join(input_path, f) for f in os.listdir(input_path)
-            if f.lower().endswith((".vtt", ".srt"))
-        ]
-        sub_files.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', os.path.basename(x))])
+    entries = parse_subtitles(input_path)
+    if not entries:
+        print("Warning: No subtitle entries found to generate TTS.")
+        return output_dir, master_path
 
-        print(f"Detected {len(sub_files)} translated subtitle files. Processing 1-to-1 matching audio files in parallel...\n")
+    print(f"Parsed {len(entries)} subtitle cues. Starting persistent TTS chunk generation...\n")
 
-        file_results = asyncio.run(
-            generate_file_level_tts_parallel(sub_files, voice, output_dir, max_workers=workers, force=force)
-        )
-        master_path = stitch_file_mp3s_to_master(file_results, master_path)
-    else:
-        out_mp3 = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(input_path))[0]}.mp3")
-        cue_semaphore = asyncio.Semaphore(workers)
-        _, _, _ = asyncio.run(process_sub_file_to_audio_async(input_path, voice, out_mp3, cue_semaphore, force=force))
-        shutil.copyfile(out_mp3, master_path)
+    cached_count, generated_count, failed_count = asyncio.run(
+        generate_chunks_parallel(entries, voice, output_dir, max_workers=workers, retries=retries, force=force)
+    )
+
+    save_manifests(entries, output_dir)
+
+    # Stitch all chunks into master voiceover track
+    master_path = stitch_chunks_to_master(entries, master_path)
 
     return output_dir, master_path
 

@@ -3,6 +3,7 @@ import re
 import asyncio
 import tempfile
 import subprocess
+import shutil
 from pydub import AudioSegment
 import edge_tts
 
@@ -38,7 +39,8 @@ def parse_single_sub_file(file_path):
         end_str = match.group(4)
         text_block = match.group(6).strip()
         
-        text = " ".join([line.strip() for line in text_block.splitlines() if line.strip()])
+        text_clean = re.sub(r"<[^>]+>", "", text_block)
+        text = " ".join([line.strip() for line in text_clean.splitlines() if line.strip()])
         if not text:
             continue
 
@@ -48,7 +50,7 @@ def parse_single_sub_file(file_path):
         entries.append({
             "start_ms": start_ms,
             "end_ms": end_ms,
-            "duration_ms": end_ms - start_ms,
+            "duration_ms": max(end_ms - start_ms, 100),
             "text": text,
             "source_file": os.path.basename(file_path)
         })
@@ -57,8 +59,7 @@ def parse_single_sub_file(file_path):
 
 def parse_subtitle_file(file_or_dir_path):
     """
-    Parses a single VTT/SRT file OR a directory containing multiple chunked VTT/SRT files 
-    (e.g., Translated/ 1_audio_txt.vtt, 2_audio.txt.vtt, etc.).
+    Parses a single VTT/SRT file OR a directory containing multiple chunked VTT/SRT files.
     Combines and sorts all subtitle scenes by start time.
     """
     all_entries = []
@@ -66,23 +67,18 @@ def parse_subtitle_file(file_or_dir_path):
     if os.path.isdir(file_or_dir_path):
         sub_files = []
         for f in os.listdir(file_or_dir_path):
-            if f.endswith(".vtt") or f.endswith(".srt"):
+            if f.lower().endswith((".vtt", ".srt")):
                 sub_files.append(os.path.join(file_or_dir_path, f))
         
-        # Sort files naturally (e.g. 1_..., 2_..., 10_...)
         sub_files.sort(key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', os.path.basename(x))])
 
-        print(f"Detected {len(sub_files)} subtitle files in translated folder:")
         for sf in sub_files:
-            print(f"  └─ {os.path.basename(sf)}")
             all_entries.extend(parse_single_sub_file(sf))
     else:
         all_entries = parse_single_sub_file(file_or_dir_path)
 
-    # Sort all entries by start_ms
     all_entries.sort(key=lambda x: x["start_ms"])
 
-    # Re-index 1..N
     for i, entry in enumerate(all_entries, 1):
         entry["index"] = i
 
@@ -110,74 +106,103 @@ def export_combined_vtt(file_or_dir_path, output_vtt):
 
     return output_vtt
 
-import shutil
-
-def stretch_audio_to_duration(input_path, output_path, target_duration_ms):
-    """Speeds up audio clip via FFmpeg atempo filter if longer than scene window."""
-    if not os.path.exists(input_path) or os.path.getsize(input_path) == 0:
-        AudioSegment.silent(duration=max(target_duration_ms, 500)).export(output_path, format="mp3")
-        return
-
-    clip = AudioSegment.from_file(input_path)
-    actual_duration_ms = len(clip)
-
-    if actual_duration_ms > target_duration_ms and target_duration_ms > 200:
-        speed_ratio = min(actual_duration_ms / target_duration_ms, 2.0)
-        cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-filter:a", f"atempo={speed_ratio:.4f}",
-            output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        shutil.copyfile(input_path, output_path)
-
-async def generate_single_tts(entry, voice, temp_dir, semaphore, retries=3):
-    """Generate TTS clip asynchronously with retry logic & fallback for edge_tts network glitches."""
-    async with semaphore:
-        raw_clip_path = os.path.join(temp_dir, f"raw_{entry['index']}.mp3")
-        adjusted_clip_path = os.path.join(temp_dir, f"adj_{entry['index']}.mp3")
-
-        for attempt in range(retries):
-            try:
-                communicate = edge_tts.Communicate(entry['text'], voice)
-                await communicate.save(raw_clip_path)
-                if os.path.exists(raw_clip_path) and os.path.getsize(raw_clip_path) > 0:
-                    break
-            except Exception as e:
-                if attempt == retries - 1:
-                    print(f"Warning: TTS failed for line {entry['index']} ('{entry['text'][:20]}...'): {e}")
-                await asyncio.sleep(0.5 * (attempt + 1))
-
-        stretch_audio_to_duration(raw_clip_path, adjusted_clip_path, entry['duration_ms'])
-        entry['audio_path'] = adjusted_clip_path
-
-async def generate_all_tts_parallel(entries, voice, temp_dir, max_workers=10):
-    """Parallel batch generator for subtitle speech clips."""
-    semaphore = asyncio.Semaphore(max_workers)
-    tasks = [generate_single_tts(entry, voice, temp_dir, semaphore) for entry in entries]
-    print(f"Generating {len(entries)} speech clips in parallel (Concurrency: {max_workers})...")
-    await asyncio.gather(*tasks)
-
-def process_synced_redub(sub_file_or_dir, output_mp3, voice="en-US-GuyNeural", max_workers=10):
-    """Master time-synced TTS generator with persistent chunk caching & manifest logging."""
-    from generate_tts_chunks import process_vtt_tts_chunks
+async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en-US-GuyNeural", max_workers=10):
+    """
+    Direct 1-pass synthesis into the master audio track with exact VTT timeline spacing.
+    No persistent chunk files left on disk!
+    """
+    entries = parse_subtitle_file(subtitle_path)
+    if not entries:
+        print("Warning: No subtitle entries found to generate TTS.")
+        return output_mp3
 
     project_dir = os.path.dirname(os.path.abspath(output_mp3))
-    chunks_dir = os.path.join(project_dir, "tts_chunks")
+    ref_audio = os.path.join(project_dir, "audio.mp3")
+    
+    max_duration_ms = max(e["end_ms"] for e in entries) + 1000
+    if os.path.exists(ref_audio) and os.path.getsize(ref_audio) > 0:
+        try:
+            ref_clip = AudioSegment.from_file(ref_audio)
+            max_duration_ms = max(max_duration_ms, len(ref_clip))
+        except Exception:
+            pass
 
-    process_vtt_tts_chunks(
-        input_path=sub_file_or_dir,
-        output_dir=chunks_dir,
-        voice=voice,
-        workers=max_workers,
-        stitch=True,
-        master_output=output_mp3
-    )
+    print(f"\n🎙️ Synthesizing {len(entries)} subtitle cues directly into master voiceover...")
+    print(f"Timeline Duration: {max_duration_ms / 1000.0:.2f}s | Voice: {voice} | Concurrency: {max_workers} workers\n")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        semaphore = asyncio.Semaphore(max_workers)
+        completed_count = 0
+        total_cues = len(entries)
+
+        async def synthesize_entry(entry):
+            nonlocal completed_count
+            async with semaphore:
+                text = entry["text"]
+                start_ms = entry["start_ms"]
+                duration_ms = entry["duration_ms"]
+                idx = entry["index"]
+                
+                raw_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
+                adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
+                
+                for attempt in range(4):
+                    try:
+                        comm = edge_tts.Communicate(text, voice)
+                        await comm.save(raw_path)
+                        if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                            break
+                    except Exception:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+
+                completed_count += 1
+                if completed_count % 20 == 0 or completed_count == total_cues or completed_count == 1:
+                    percent = (completed_count / total_cues) * 100
+                    print(f"🎙️ Progress: [{completed_count}/{total_cues}] cues synthesized ({percent:.1f}%)...", flush=True)
+
+                if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+                    return start_ms, None
+
+                try:
+                    clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
+                    if len(clip) > duration_ms and duration_ms > 200:
+                        speed_ratio = min(len(clip) / duration_ms, 2.0)
+                        proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-i", raw_path,
+                            "-filter:a", f"atempo={speed_ratio:.4f}",
+                            adj_path,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL
+                        )
+                        await proc.communicate()
+                        if os.path.exists(adj_path):
+                            clip = await asyncio.to_thread(AudioSegment.from_file, adj_path)
+                    return start_ms, clip
+                except Exception:
+                    return start_ms, None
+
+        tasks = [synthesize_entry(e) for e in entries]
+        results = await asyncio.gather(*tasks)
+
+        print("\n🧩 Stitching audio clips into master voiceover timeline...", flush=True)
+        master_audio = AudioSegment.silent(duration=max_duration_ms)
+        success_count = 0
+        for start_ms, clip in results:
+            if clip is not None and len(clip) > 0:
+                master_audio = master_audio.overlay(clip, position=start_ms)
+                success_count += 1
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_mp3)), exist_ok=True)
+        await asyncio.to_thread(master_audio.export, output_mp3, format="mp3")
+        print(f"🎉 Master synced voiceover ({success_count}/{len(entries)} cues, {len(master_audio)/1000.0:.2f}s) exported to: {output_mp3}")
+        return output_mp3
+
+def process_synced_redub(sub_file_or_dir, output_mp3, voice="en-US-GuyNeural", max_workers=10):
+    """Master time-synced TTS generator."""
+    asyncio.run(process_synced_redub_direct_async(sub_file_or_dir, output_mp3, voice=voice, max_workers=max_workers))
 
 def generate_voiceover(subtitle_path, project_dir, voice="en-US-GuyNeural", workers=10):
     """Wrapper function for project output folder."""
     output_voiceover = os.path.join(project_dir, "synced_voiceover.mp3")
     process_synced_redub(subtitle_path, output_voiceover, voice=voice, max_workers=workers)
     return output_voiceover
-
