@@ -73,7 +73,7 @@ def merge_project_video(video_path, voiceover_path, bgm_path, project_dir, sub_p
             "-vf", vf_filter,
             "-map", "0:v",
             "-map", "1:a",
-            "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-threads", "0", "-crf", "24",
             "-c:a", "aac", "-b:a", "192k",
             final_output
         ]
@@ -92,7 +92,7 @@ def merge_project_video(video_path, voiceover_path, bgm_path, project_dir, sub_p
             "-filter_complex", filter_complex,
             "-map", "0:v",
             "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "23",
+            "-c:v", "libx264", "-preset", "fast", "-threads", "0", "-crf", "24",
             "-c:a", "aac", "-b:a", "192k",
             final_output
         ]
