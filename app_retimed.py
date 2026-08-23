@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """
 =============================================================================
-             AI RECAP VIDEO GENERATOR - SOFTWARE ENGINE (v1.5)
+         AI RECAP VIDEO GENERATOR - AUDIO-DRIVEN RETIMED ENGINE (v1.5)
 =============================================================================
-Modular, commercial-grade software engine with full State Management, Caching, 
-and Multi-File Subtitle Support in Translated/ subfolder.
+Command 2: Natural Speech & Audio-Driven Video Retiming Engine.
 
-Structure per Project:
-  output/<project_name>/
-    ├── video.mp4               (Original MP4 video)
-    ├── audio.mp3               (Original audio track)
-    ├── audio.vtt               (Original transcribed subtitles from Whisper)
-    ├── bgm_music.mp3           (Isolated background music/SFX)
-    ├── synced_voiceover.mp3    (Generated frame-synced voiceover)
-    ├── FINAL_RECAP.mp4         (Final redubbed video)
-    └── Translated/             📁 Dedicated folder for translated subtitles
-        ├── 1_audio_txt.vtt     📝 Chunked subtitle files (1, 2, 3...) for fast parallel translation
-        ├── 2_audio_txt.vtt
-        └── ...
+Synthesizes Edge-TTS audio at 100% natural, uncompressed speaking speed.
+Dynamically retimes (stretches/pauses) video clips & recalculates subtitle
+timestamps so the story flows comfortably without rushed narration.
 """
 
 import os
@@ -27,59 +17,39 @@ from core.state_manager import StateManager, extract_video_id
 from core.downloader import download_media
 from core.transcriber import transcribe_media
 from core.separator import separate_bgm
-from core.tts_engine import generate_voiceover
-from core.video_merger import merge_project_video
+from core.video_retimer import process_audio_driven_retiming
+from app import get_translated_subtitle_path
 
-def get_translated_subtitle_path(project_dir):
+def process_retimed_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 
+                                 source_lang="Chinese", bgm_volume=0.4, workers=10, 
+                                 burn_subtitles=False, force=False, pause_after_transcribe=True,
+                                 auto_continue=False, model="medium", device=None, mode=1,
+                                 compute_type=None, vad_filter=True, batched=True, threads=None):
     """
-    Checks for Translated/ or translated/ subfolders containing .vtt or .srt files.
-    Returns directory path if multiple files exist, or single file path, or None.
+    Audio-driven retimed recap controller.
     """
-    possible_dirs = [
-        os.path.join(project_dir, "Translated"),
-        os.path.join(project_dir, "translated")
-    ]
-    for t_dir in possible_dirs:
-        if os.path.exists(t_dir) and os.path.isdir(t_dir):
-            files = [f for f in os.listdir(t_dir) if f.endswith(".vtt") or f.endswith(".srt")]
-            if files:
-                return t_dir
-    return None
-
-def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 
-                          source_lang="Chinese", bgm_volume=0.4, workers=10, 
-                          burn_subtitles=False, force=False, pause_after_transcribe=True,
-                          auto_continue=False, model="medium", device=None, mode=1,
-                          compute_type=None, vad_filter=True, batched=True, threads=None):
-    """
-    State-managed master controller for the AI Recap pipeline with GPU acceleration & 4 output merge modes.
-    """
-    # 1. Resolve project name & directory
     if not project_name or project_name == "my_recap_project":
         project_name = extract_video_id(source_input)
 
     project_dir = os.path.join("output", project_name)
     os.makedirs(project_dir, exist_ok=True)
 
-    # 2. Initialize State Manager
     state_mgr = StateManager(project_dir, source=source_input, force=force)
 
     print("=========================================================================")
-    print(f"       AI RECAP PROJECT: {project_name}")
+    print(f"       AI RECAP PROJECT (AUDIO-DRIVEN RETIMED): {project_name}")
     print(f"       Project Path: {os.path.abspath(project_dir)}")
     print("=========================================================================")
 
     video_path = os.path.join(project_dir, "video.mp4")
     audio_path = os.path.join(project_dir, "audio.mp3")
     bgm_path = os.path.join(project_dir, "bgm_music.mp3")
-    voiceover_path = os.path.join(project_dir, "synced_voiceover.mp3")
     final_video_path = os.path.join(project_dir, "FINAL_RECAP.mp4")
-
     orig_sub_path = os.path.join(project_dir, "audio.vtt")
 
     # Step 1: Download Video & Extract Audio
     if state_mgr.is_step_completed("download", [video_path, audio_path]):
-        print(f"\n⏩ [1/5] Step 'download' already COMPLETED (cached). Skipping.")
+        print(f"\n⏩ [1/4] Step 'download' already COMPLETED (cached). Skipping.")
     else:
         video_path, audio_path = download_media(source_input, project_dir)
         state_mgr.mark_step_completed("download", [video_path, audio_path])
@@ -87,7 +57,7 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     # Step 2: Transcribe Audio to Subtitles with Timestamps
     transcribe_just_completed = False
     if state_mgr.is_step_completed("transcribe", [orig_sub_path]):
-        print(f"\n⏩ [2/5] Step 'transcribe' already COMPLETED (cached). Skipping.")
+        print(f"\n⏩ [2/4] Step 'transcribe' already COMPLETED (cached). Skipping.")
     else:
         orig_sub_path, _ = transcribe_media(
             audio_path, project_dir, source_lang=source_lang, model=model, device=device,
@@ -96,13 +66,14 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
         state_mgr.mark_step_completed("transcribe", [orig_sub_path])
         transcribe_just_completed = True
 
-    # Step 3: AI Audio Separation (Isolate Background Music)
-    # Mode 1 (Video+Audio) and Mode 3 (Video+Audio+Transcript) do not use BGM
+    # Step 3: AI Audio Separation (if BGM needed)
     if mode in [1, 3]:
-        print(f"\n⏩ [3/5] Mode {mode} does not require Background Music. Skipping AI Audio Separation.")
+        print(f"\n⏩ [3/4] Mode {mode} does not require Background Music. Skipping AI Audio Separation.")
         bgm_path = None
+        if not state_mgr.is_step_completed("separate_bgm"):
+            state_mgr.mark_step_completed("separate_bgm", [])
     elif state_mgr.is_step_completed("separate_bgm", [bgm_path]):
-        print(f"\n⏩ [3/5] Step 'separate_bgm' already COMPLETED (cached). Skipping.")
+        print(f"\n⏩ [3/4] Step 'separate_bgm' already COMPLETED (cached). Skipping.")
     else:
         bgm_path = separate_bgm(audio_path, project_dir, device=device)
         state_mgr.mark_step_completed("separate_bgm", [bgm_path])
@@ -114,46 +85,48 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
         print("\n=========================================================================")
         print("⏸️ PIPELINE PAUSED FOR SUBTITLE TRANSLATION")
         print("=========================================================================")
-        print(f"Steps 1, 2, and 3 (Download, Transcription, and BGM Separation) are COMPLETE!\n")
+        print(f"Steps 1, 2, and 3 are COMPLETE!\n")
         print(f"📄 Original Subtitles: {os.path.abspath(orig_sub_path)}")
         print(f"📁 Translated Folder:  {os.path.abspath(os.path.join(project_dir, 'Translated'))}")
         print("\n📝 NEXT STEPS:")
-        print("1. Add or edit your translated subtitle files inside 'Translated/' (e.g. 1_audio_txt.vtt, 2_audio_txt.vtt...).")
+        print("1. Add or edit your translated subtitle files inside 'Translated/'.")
         print("2. Save the files.")
-        print(f"3. Re-run this command to generate your voiceover & final video:")
-        print(f"   python app.py \"{source_input}\" -name {project_name} --auto-continue")
+        print(f"3. Re-run this command to generate your retimed voiceover & video:")
+        print(f"   python app_retimed.py \"{source_input}\" -name {project_name} --auto-continue")
         print("=========================================================================\n")
         return translated_sub_input or orig_sub_path
 
-    # Step 4: Time-Synced TTS Voiceover Generation
+    # Step 4: Audio-Driven Video Retiming & Synthesis
     active_sub_path = translated_sub_input if translated_sub_input else orig_sub_path
-    print(f"\n[4/5] Using subtitle source for narration: {active_sub_path}")
+    print(f"\n[4/4] Generating natural speech narration & retiming video: {active_sub_path}")
 
-    if state_mgr.is_step_completed("voiceover", [voiceover_path]):
-        print(f"⏩ Step 'voiceover' already COMPLETED (cached). Skipping.")
-    else:
-        voiceover_path = generate_voiceover(active_sub_path, project_dir, voice=voice, workers=workers)
-        state_mgr.mark_step_completed("voiceover", [voiceover_path])
-
-    # Step 5: Final Video Assembly
     if state_mgr.is_step_completed("merge_video", [final_video_path]):
-        print(f"\n⏩ [5/5] Step 'merge_video' already COMPLETED (cached). Skipping.")
+        print(f"\n⏩ [4/4] Step 'merge_video' already COMPLETED (cached). Skipping.")
     else:
-        final_video_path = merge_project_video(
-            video_path, voiceover_path, bgm_path, project_dir,
-            sub_path=active_sub_path, bgm_volume=bgm_volume, burn_subtitles=burn_subtitles, mode=mode
+        state_mgr.set_project_status("PROCESSING_RETIMED_RECAP")
+        final_video_path = process_audio_driven_retiming(
+            video_path=video_path,
+            sub_path=active_sub_path,
+            project_dir=project_dir,
+            voice=voice,
+            bgm_path=bgm_path,
+            bgm_volume=bgm_volume,
+            burn_subtitles=burn_subtitles,
+            mode=mode,
+            max_workers=workers,
+            state_mgr=state_mgr
         )
         state_mgr.mark_step_completed("merge_video", [final_video_path])
         state_mgr.set_project_status("COMPLETED")
 
     print(f"\n=========================================================================")
-    print(f"🎉 PROJECT READY AT: {os.path.abspath(final_video_path)}")
+    print(f"🎉 RETIMED RECAP PROJECT READY AT: {os.path.abspath(final_video_path)}")
     print(f"=========================================================================\n")
 
     return final_video_path
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="State-Managed AI Recap Video Generator Engine")
+    parser = argparse.ArgumentParser(description="Audio-Driven Retimed AI Recap Video Generator Engine")
     parser.add_argument("source", help="YouTube URL or local input video path")
     parser.add_argument("-name", "--project-name", help="Project name (defaults to video ID/name under output/)")
     parser.add_argument("-v", "--voice", default="en-US-GuyNeural", help="Edge-TTS narrator voice name")
@@ -175,7 +148,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    process_recap_project(
+    process_retimed_recap_project(
         source_input=args.source,
         project_name=args.project_name,
         voice=args.voice,

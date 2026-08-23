@@ -107,7 +107,8 @@ python generate_tts_chunks.py output/anime_ep1/Translated --stitch
 
 | Goal | Command |
 | :--- | :--- |
-| **Run Initial Processing** | `python app.py "https://..." -name project1` |
+| **Command 1: Standard Fast Recap (Original Video Speed)** | `python app.py "https://..." -name project1 -v en-US-AriaNeural --burn-subtitles -mode 3` |
+| **Command 2: Audio-Driven Retimed Recap (Natural Speech & Video Retiming)** | `python app_retimed.py "https://..." -name project1 -v en-US-AriaNeural --burn-subtitles -mode 3` |
 | **Default Fast Merge (Video + Audio)** | `python app.py "https://..." -name project1 --auto-continue` |
 | **Merge Video + Audio + BGM Music** | `python app.py "https://..." -name project1 -mode 2 --auto-continue` |
 | **Merge Video + Audio + Burned Transcript** | `python app.py "https://..." -name project1 -mode 3 --auto-continue` |
