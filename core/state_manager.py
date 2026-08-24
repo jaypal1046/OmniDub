@@ -101,9 +101,10 @@ class StateManager:
         with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2)
 
-    def is_step_completed(self, step_name, required_files=None):
+    def is_step_completed(self, step_name, required_files=None, current_params=None):
         """
-        Checks if a step is marked COMPLETED and all its required output files exist.
+        Checks if a step is marked COMPLETED and all its required output files exist,
+        and verifies if execution parameters (like voice) match.
         """
         if self.force:
             return False
@@ -112,6 +113,13 @@ class StateManager:
         if step_info.get("status") != "COMPLETED":
             return False
 
+        if current_params:
+            stored_params = step_info.get("params", {})
+            for k, v in current_params.items():
+                if stored_params.get(k) != v:
+                    print(f"🔄 Parameter change detected for step [{step_name}] ({k}: '{stored_params.get(k)}' -> '{v}'). Invalidating cached step.")
+                    return False
+
         if required_files:
             for fpath in required_files:
                 if not fpath or not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
@@ -119,9 +127,9 @@ class StateManager:
 
         return True
 
-    def mark_step_completed(self, step_name, result_files=None):
+    def mark_step_completed(self, step_name, result_files=None, params=None):
         """
-        Marks a pipeline step as COMPLETED and records its result file paths.
+        Marks a pipeline step as COMPLETED and records its result file paths and parameters.
         """
         if "steps" not in self.state:
             self.state["steps"] = {}
@@ -129,7 +137,8 @@ class StateManager:
         self.state["steps"][step_name] = {
             "status": "COMPLETED",
             "completed_at": datetime.now().isoformat(),
-            "result_files": result_files or []
+            "result_files": result_files or [],
+            "params": params or {}
         }
         self.save_state()
         print(f"✅ Step [{step_name}] marked COMPLETED.")

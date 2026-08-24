@@ -23,8 +23,15 @@ def parse_time_to_ms(time_str):
     seconds = float(s)
     return int((int(h) * 3600 + int(m) * 60 + seconds) * 1000)
 
+def ms_to_vtt_timestamp(ms):
+    """Converts milliseconds to VTT timestamp string (HH:MM:SS.mmm)."""
+    seconds, milliseconds = divmod(ms, 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
 def parse_single_sub_file(file_path):
-    """Parses a single .vtt or .srt file returning timed text entries."""
+    """Parses a single .vtt or .srt file returning timed text entries with automatic repetition deduplication."""
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -33,7 +40,7 @@ def parse_single_sub_file(file_path):
         re.DOTALL
     )
 
-    entries = []
+    raw_entries = []
     for match in pattern.finditer(content):
         start_str = match.group(2)
         end_str = match.group(4)
@@ -47,7 +54,7 @@ def parse_single_sub_file(file_path):
         start_ms = parse_time_to_ms(start_str)
         end_ms = parse_time_to_ms(end_str)
 
-        entries.append({
+        raw_entries.append({
             "start_ms": start_ms,
             "end_ms": end_ms,
             "duration_ms": max(end_ms - start_ms, 100),
@@ -55,7 +62,40 @@ def parse_single_sub_file(file_path):
             "source_file": os.path.basename(file_path)
         })
 
+    # Deduplicate consecutive identical text cues (Whisper repetition hallucination filter)
+    entries = []
+    for entry in raw_entries:
+        if entries:
+            last = entries[-1]
+            norm_last = re.sub(r"[^\w]", "", last["text"].lower())
+            norm_curr = re.sub(r"[^\w]", "", entry["text"].lower())
+            if norm_last and norm_last == norm_curr:
+                last["end_ms"] = max(last["end_ms"], entry["end_ms"])
+                last["duration_ms"] = max(last["end_ms"] - last["start_ms"], 100)
+                continue
+        entries.append(entry)
+
     return entries
+
+def clean_subtitle_file(file_path):
+    """
+    Cleans a VTT/SRT file by merging consecutive duplicate subtitle cues.
+    Overwrites the file on disk.
+    """
+    if not os.path.exists(file_path):
+        return file_path
+
+    entries = parse_single_sub_file(file_path)
+    lines = ["WEBVTT\n"]
+    for entry in entries:
+        start_ts = ms_to_vtt_timestamp(entry["start_ms"])
+        end_ts = ms_to_vtt_timestamp(entry["end_ms"])
+        lines.append(f"\n{start_ts} --> {end_ts}\n{entry['text']}\n")
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    print(f"🧹 Cleaned duplicate subtitle hallucinations in: {file_path}")
+    return file_path
 
 def parse_subtitle_file(file_or_dir_path):
     """

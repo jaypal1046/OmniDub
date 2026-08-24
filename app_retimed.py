@@ -100,8 +100,9 @@ def process_retimed_recap_project(source_input, project_name=None, voice="en-US-
     active_sub_path = translated_sub_input if translated_sub_input else orig_sub_path
     print(f"\n[4/4] Generating natural speech narration & retiming video: {active_sub_path}")
 
-    if state_mgr.is_step_completed("merge_video", [final_video_path]):
-        print(f"\n⏩ [4/4] Step 'merge_video' already COMPLETED (cached). Skipping.")
+    current_merge_params = {"voice": voice, "mode": mode, "burn_subtitles": burn_subtitles, "active_sub_path": active_sub_path}
+    if state_mgr.is_step_completed("merge_video", [final_video_path], current_params=current_merge_params):
+        print(f"\n⏩ [4/4] Step 'merge_video' already COMPLETED (cached for voice '{voice}'). Skipping.")
     else:
         state_mgr.set_project_status("PROCESSING_RETIMED_RECAP")
         final_video_path = process_audio_driven_retiming(
@@ -116,7 +117,7 @@ def process_retimed_recap_project(source_input, project_name=None, voice="en-US-
             max_workers=workers,
             state_mgr=state_mgr
         )
-        state_mgr.mark_step_completed("merge_video", [final_video_path])
+        state_mgr.mark_step_completed("merge_video", [final_video_path], params=current_merge_params)
         state_mgr.set_project_status("COMPLETED")
 
     print(f"\n=========================================================================")

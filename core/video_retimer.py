@@ -51,9 +51,11 @@ def export_retimed_vtt(retimed_entries, output_vtt):
 async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-AriaNeural", max_workers=10):
     """
     Synthesizes Edge-TTS audio clips at 100% natural, uncompressed speed with persistent disk caching.
-    Skips synthesizing any clip that already exists in tts_cache_dir.
+    Skips synthesizing any clip that already exists in voice-specific tts_cache_dir.
     """
-    os.makedirs(tts_cache_dir, exist_ok=True)
+    safe_voice = re.sub(r"[^\w\-]", "_", voice)
+    voice_cache_dir = os.path.join(tts_cache_dir, safe_voice)
+    os.makedirs(voice_cache_dir, exist_ok=True)
     semaphore = asyncio.Semaphore(max_workers)
     total = len(entries)
     completed = 0
@@ -64,7 +66,7 @@ async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-
         nonlocal completed, cached_count
         async with semaphore:
             text = entry["text"]
-            raw_path = os.path.join(tts_cache_dir, f"nat_{idx}.mp3")
+            raw_path = os.path.join(voice_cache_dir, f"nat_{idx}.mp3")
 
             if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
                 for attempt in range(4):
@@ -81,7 +83,7 @@ async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-
             completed += 1
             if completed % 50 == 0 or completed == total or completed == 1:
                 percent = (completed / total) * 100
-                print(f"🎙️ Natural TTS Progress: [{completed}/{total}] ({percent:.1f}%) [Cached: {cached_count}]...", flush=True)
+                print(f"🎙️ Natural TTS Progress ({voice}): [{completed}/{total}] ({percent:.1f}%) [Cached: {cached_count}]...", flush=True)
 
             if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
                 clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
@@ -127,38 +129,40 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Step 1: Generate natural TTS clips with persistent caching
-        print("\n[1/4] Generating natural, uncompressed TTS audio clips (cached in tts_cache/)...")
+        print(f"\n[1/4] Generating natural, uncompressed TTS audio clips for voice '{voice}'...")
         synth_results = asyncio.run(generate_natural_tts_clips_async(entries, tts_cache_dir, voice=voice, max_workers=max_workers))
         if state_mgr:
-            state_mgr.mark_step_completed("tts_clips", [tts_cache_dir])
+            state_mgr.mark_step_completed("tts_clips", [tts_cache_dir], params={"voice": voice})
 
         # Step 2: Build Seamless Retimed Timeline Mapping
         print("\n[2/4] Computing seamless retimed video timeline & subtitle mapping...")
         retimed_entries = []
-        video_segments = []
+        # Ensure synth_results are chronologically ordered by start_ms
+        synth_results = sorted(synth_results, key=lambda x: x["entry"]["start_ms"])
 
+        video_segments = []
         curr_orig_ms = 0
         curr_new_ms = 0
 
         for item in synth_results:
             entry = item["entry"]
-            start_ms = entry["start_ms"]
-            end_ms = entry["end_ms"]
+            start_ms = max(entry["start_ms"], curr_orig_ms)
+            end_ms = max(entry["end_ms"], start_ms + 100)
             orig_dur_ms = max(end_ms - start_ms, 100)
             actual_audio_ms = item["actual_duration_ms"]
 
             # If there is a silence gap before this cue, check if we need it or can absorb/trim it
             if start_ms > curr_orig_ms:
                 gap_dur_ms = start_ms - curr_orig_ms
-                # Keep gap only if speech hasn't overflowed into it
-                video_segments.append({
-                    "type": "gap",
-                    "orig_start_ms": curr_orig_ms,
-                    "orig_end_ms": start_ms,
-                    "target_dur_ms": gap_dur_ms,
-                    "ratio": 1.0
-                })
-                curr_new_ms += gap_dur_ms
+                if gap_dur_ms > 0:
+                    video_segments.append({
+                        "type": "gap",
+                        "orig_start_ms": curr_orig_ms,
+                        "orig_end_ms": start_ms,
+                        "target_dur_ms": gap_dur_ms,
+                        "ratio": 1.0
+                    })
+                    curr_new_ms += gap_dur_ms
                 curr_orig_ms = start_ms
 
             # Match cue video segment duration EXACTLY to natural audio duration
@@ -189,14 +193,15 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
         # Final gap after last cue
         if total_video_ms > curr_orig_ms:
             final_gap_ms = total_video_ms - curr_orig_ms
-            video_segments.append({
-                "type": "gap",
-                "orig_start_ms": curr_orig_ms,
-                "orig_end_ms": total_video_ms,
-                "target_dur_ms": final_gap_ms,
-                "ratio": 1.0
-            })
-            curr_new_ms += final_gap_ms
+            if final_gap_ms > 0:
+                video_segments.append({
+                    "type": "gap",
+                    "orig_start_ms": curr_orig_ms,
+                    "orig_end_ms": total_video_ms,
+                    "target_dur_ms": final_gap_ms,
+                    "ratio": 1.0
+                })
+                curr_new_ms += final_gap_ms
 
         retimed_total_duration_s = curr_new_ms / 1000.0
         print(f"⏱️ Retimed Total Video Duration: {retimed_total_duration_s:.2f}s (adjusted by +{(curr_new_ms - total_video_ms)/1000.0:.2f}s for seamless speech)")
@@ -233,8 +238,11 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
         # Combine adjacent unstretched segments to reduce total segment count
         merged_segments = []
         for seg in video_segments:
+            if seg["orig_end_ms"] <= seg["orig_start_ms"]:
+                continue
+
             if merged_segments and merged_segments[-1]["ratio"] <= 1.01 and seg["ratio"] <= 1.01:
-                merged_segments[-1]["orig_end_ms"] = seg["orig_end_ms"]
+                merged_segments[-1]["orig_end_ms"] = max(merged_segments[-1]["orig_end_ms"], seg["orig_end_ms"])
                 merged_segments[-1]["target_dur_ms"] += seg["target_dur_ms"]
             else:
                 merged_segments.append(dict(seg))
@@ -247,6 +255,10 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
             seg_out = os.path.join(seg_dir, f"seg_{idx:04d}.mp4")
             start_s = seg["orig_start_ms"] / 1000.0
             end_s = seg["orig_end_ms"] / 1000.0
+
+            if end_s <= start_s + 0.01:
+                end_s = start_s + 0.1
+
             ratio = seg["ratio"]
 
             # Pure continuous motion setpts filter (NO static tpad frame freezing!)

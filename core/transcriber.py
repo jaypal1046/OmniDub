@@ -2,20 +2,39 @@ import os
 import shutil
 import subprocess
 
-def transcribe_media(audio_path, project_dir, source_lang="Chinese", model="medium", **kwargs):
+def transcribe_media(audio_path, project_dir, source_lang="Chinese", model="medium",
+                     device=None, compute_type=None, vad_filter=True, batched=True,
+                     threads=None, condition_on_previous_text=False, **kwargs):
     """
-    Transcribes audio using faster-whisper into project_dir.
-    Creates original transcript (project_dir/audio.vtt) and template inside
-    translated/ subfolder (project_dir/translated/audio.vtt).
-    Returns (original_sub_path, translated_sub_path).
+    Transcribes audio using faster-whisper (whisper-ctranslate2) into project_dir.
+    Applies VAD filtering, anti-repetition penalties, and condition_on_previous_text=False
+    to eliminate Whisper hallucination loops.
     """
-    print(f"\n[2/5] Transcribing Audio ({source_lang}) to Subtitles...")
-    subprocess.run([
+    print(f"\n[2/5] Transcribing Audio ({source_lang}) to Subtitles (Model: {model})...")
+    
+    cmd = [
         "whisper-ctranslate2", audio_path,
         "--output_dir", project_dir,
         "--language", source_lang,
-        "--model", model
-    ], check=True)
+        "--model", model,
+        "--condition_on_previous_text", "True" if condition_on_previous_text else "False",
+        "--repetition_penalty", "1.2"
+    ]
+
+    if vad_filter:
+        cmd.extend(["--vad_filter", "True"])
+
+    if device:
+        cmd.extend(["--device", str(device)])
+
+    if compute_type:
+        cmd.extend(["--compute_type", str(compute_type)])
+
+    if threads:
+        cmd.extend(["--threads", str(threads)])
+
+    print(f"🎙️ Running Whisper command: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
     base_name = os.path.splitext(os.path.basename(audio_path))[0]
     raw_vtt = os.path.join(project_dir, f"{base_name}.vtt")
@@ -38,6 +57,11 @@ def transcribe_media(audio_path, project_dir, source_lang="Chinese", model="medi
     else:
         original_sub = orig_vtt
         ext = ".vtt"
+
+    # Clean duplicate Whisper hallucination loops
+    if os.path.exists(original_sub):
+        from core.tts_engine import clean_subtitle_file
+        clean_subtitle_file(original_sub)
 
     # Setup translated/ subfolder and template file
     translated_dir = os.path.join(project_dir, "translated")

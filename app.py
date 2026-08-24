@@ -129,21 +129,23 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
     active_sub_path = translated_sub_input if translated_sub_input else orig_sub_path
     print(f"\n[4/5] Using subtitle source for narration: {active_sub_path}")
 
-    if state_mgr.is_step_completed("voiceover", [voiceover_path]):
-        print(f"⏩ Step 'voiceover' already COMPLETED (cached). Skipping.")
+    voiceover_params = {"voice": voice, "active_sub_path": active_sub_path}
+    if state_mgr.is_step_completed("voiceover", [voiceover_path], current_params=voiceover_params):
+        print(f"⏩ Step 'voiceover' already COMPLETED (cached for voice '{voice}'). Skipping.")
     else:
         voiceover_path = generate_voiceover(active_sub_path, project_dir, voice=voice, workers=workers)
-        state_mgr.mark_step_completed("voiceover", [voiceover_path])
+        state_mgr.mark_step_completed("voiceover", [voiceover_path], params=voiceover_params)
 
     # Step 5: Final Video Assembly
-    if state_mgr.is_step_completed("merge_video", [final_video_path]):
-        print(f"\n⏩ [5/5] Step 'merge_video' already COMPLETED (cached). Skipping.")
+    merge_params = {"voice": voice, "mode": mode, "burn_subtitles": burn_subtitles, "active_sub_path": active_sub_path}
+    if state_mgr.is_step_completed("merge_video", [final_video_path], current_params=merge_params):
+        print(f"\n⏩ [5/5] Step 'merge_video' already COMPLETED (cached for voice '{voice}'). Skipping.")
     else:
         final_video_path = merge_project_video(
             video_path, voiceover_path, bgm_path, project_dir,
             sub_path=active_sub_path, bgm_volume=bgm_volume, burn_subtitles=burn_subtitles, mode=mode
         )
-        state_mgr.mark_step_completed("merge_video", [final_video_path])
+        state_mgr.mark_step_completed("merge_video", [final_video_path], params=merge_params)
         state_mgr.set_project_status("COMPLETED")
 
     print(f"\n=========================================================================")

@@ -46,7 +46,7 @@ def ms_to_timestamp(ms):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
 def parse_single_sub_file(file_path):
-    """Parses a single .vtt or .srt file returning timed text entries."""
+    """Parses a single .vtt or .srt file returning timed text entries with automatic repetition deduplication."""
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -55,7 +55,7 @@ def parse_single_sub_file(file_path):
         re.DOTALL
     )
 
-    entries = []
+    raw_entries = []
     for match in pattern.finditer(content):
         start_str = match.group(2)
         end_str = match.group(4)
@@ -70,7 +70,7 @@ def parse_single_sub_file(file_path):
         start_ms = parse_time_to_ms(start_str)
         end_ms = parse_time_to_ms(end_str)
 
-        entries.append({
+        raw_entries.append({
             "start_time": ms_to_timestamp(start_ms),
             "end_time": ms_to_timestamp(end_ms),
             "start_ms": start_ms,
@@ -79,6 +79,20 @@ def parse_single_sub_file(file_path):
             "text": text,
             "source_file": os.path.basename(file_path)
         })
+
+    # Deduplicate consecutive identical text cues (Whisper repetition hallucination filter)
+    entries = []
+    for entry in raw_entries:
+        if entries:
+            last = entries[-1]
+            norm_last = re.sub(r"[^\w]", "", last["text"].lower())
+            norm_curr = re.sub(r"[^\w]", "", entry["text"].lower())
+            if norm_last and norm_last == norm_curr:
+                last["end_ms"] = max(last["end_ms"], entry["end_ms"])
+                last["end_time"] = ms_to_timestamp(last["end_ms"])
+                last["duration_ms"] = max(last["end_ms"] - last["start_ms"], 100)
+                continue
+        entries.append(entry)
 
     return entries
 
