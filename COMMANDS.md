@@ -8,12 +8,47 @@ This guide explains **when to run which command** and provides copy-paste ready 
 
 | Engine | Command | Description | Best Used For |
 | :--- | :--- | :--- | :--- |
-| **Command 1: Standard Recap Engine** | `python app.py ...` | Fast stream-copy merge. Original video duration **never changes**. Speech audio is fitted to original timestamps. | Quick recaps where exact video length must be preserved. |
-| **Command 2: Retimed Engine** *(Recommended)* | `python app_retimed.py ...` | **100% Natural English speech speed**. Video motion dynamically retimes (stretches/pauses smoothly) so the story flows comfortably without rushed speech. | Comfortable, high-quality storytelling where narration sounds natural and clear. |
+| **Engine 1: Manhwa 16:9 Recap Engine** *(Recommended)* | `python app_manhwa.py ...` | Smart OpenCV comic panel slicing (`cv2.findContours`), page-level minimal AI Vision scripting (38 calls max), 16:9 landscape video layout (`1920x1080`) with blurred background canvas, and parallel TTS audio/video rendering. | **AsuraScans / Webtoon / Comic Recap Videos** for YouTube. |
+| **Engine 2: Retimed Video Engine** | `python app_retimed.py ...` | **100% Natural English speech speed**. Video motion dynamically retimes (stretches/pauses smoothly) so the story flows comfortably without rushed speech. | Comfortable, high-quality video storytelling where narration sounds natural. |
+| **Engine 3: Standard Video Recap Engine** | `python app.py ...` | Fast stream-copy merge. Original video duration **never changes**. Speech audio is fitted to original timestamps. | Quick recaps where exact video length must be preserved. |
 
 ---
 
-## 🛠️ Step-by-Step Production Workflow
+## 🎨 Manhwa & Webtoon Recap Generator Commands (`app_manhwa.py`)
+
+### 1. Basic 16:9 Landscape YouTube Video (Default)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1"
+```
+
+### 2. Custom Output Folder Name (`-o`)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1" -o my_ch1_recap
+```
+
+### 3. 9:16 Vertical Reel / Shorts Aspect Ratio (`--aspect 9:16`)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1" -o ch1_reels --aspect 9:16
+```
+
+### 4. Custom Parallel Worker Threads (`-w`)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1" -w 12
+```
+
+### 5. Custom Narrator Voice (`-v`)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1" -v en-US-AriaNeural
+```
+
+### 6. Force Re-run All Pipeline Steps (`--force`)
+```bash
+python app_manhwa.py "https://asurascans.com/comics/30-years-since-the-prologue-b57aa235/chapter/1" -o my_ch1_recap --force
+```
+
+---
+
+## 🛠️ Step-by-Step Video Production Workflow (`app_retimed.py` & `app.py`)
 
 ### Step 1: Initial Processing (Download & Transcribe)
 Run either engine to download the video, extract audio, and generate original subtitles.
@@ -71,19 +106,6 @@ Use `app.py` for fast processing where video duration remains identical to origi
 | `-mode 2` | Video + Voiceover Audio + Isolated BGM Music | Audio Re-mix (~10s) |
 | **`-mode 3`** | **Video + Voiceover Audio + Burned Subtitles (NO BGM)** | Subtitle Re-encode |
 | `-mode 4` | Video + Voiceover Audio + Isolated BGM + Burned Subtitles | Audio Re-mix + Subtitle Re-encode |
-
----
-
-## ⚡ Useful Options & Flags
-
-| Flag | Purpose | Example |
-| :--- | :--- | :--- |
-| `-v <voice>` | Change Edge-TTS Narrator Voice | `-v en-US-ChristopherNeural` or `-v en-US-AriaNeural` |
-| `-w <num>` | Parallel TTS Concurrency Workers | `-w 15` (Faster TTS generation) |
-| `-m <model>` | Whisper Speech Recognition Model | `-m large-v3-turbo` or `-m medium` |
-| `-d <device>` | AI Acceleration Hardware | `-d cuda` (Use NVIDIA GPU) or `-d cpu` |
-| `--force` | Bypass cached state and force re-run all steps | `--force` |
-| `--auto-continue` | Skip manual pause prompt and continue to video merge | `--auto-continue` |
 
 ---
 
