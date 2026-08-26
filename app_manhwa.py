@@ -180,74 +180,93 @@ def process_manhwa_recap_project(source_input, project_name=None, voice="en-US-C
         print(f"✅ OCR results exported to:\n  📄 {ocr_json_path}\n  📄 {ocr_txt_path}")
 
     # -------------------------------------------------------------------------
-    # STEP 3: PAGE-LEVEL MINIMAL GEMINI AI SCRIPT GENERATION (38 requests max)
+    # STEP 3: INDIVIDUAL PANEL-LEVEL GEMINI AI SCRIPT GENERATION (MD5 HASH CACHED)
     # -------------------------------------------------------------------------
-    print(f"\n🤖 [3/6] Step 'gemini_script': Generating Story Scripts per Page ({len(raw_pages) if raw_pages else total_panels} AI calls max)...")
+    print(f"\n🤖 [3/6] Step 'gemini_script': Generating Story Scripts for all {total_panels} Panel Clips...")
     script_items = []
-    if state_mgr.is_step_completed("gemini_script"):
+
+    def get_file_md5(filepath):
+        import hashlib
+        if not os.path.exists(filepath):
+            return ""
+        hasher = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            buf = f.read(65536)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = f.read(65536)
+        return hasher.hexdigest()
+
+    # Load existing script cache by image MD5 / filename
+    cache_json_path = os.path.join(project_dir, "panel_script_cache.json")
+    script_cache = {}
+
+    for cache_path in (recap_script_json_path, cache_json_path):
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached_list = json.load(f)
+                    for c_item in cached_list:
+                        c_hash = c_item.get("md5", "")
+                        c_file = c_item.get("file", "")
+                        if c_item.get("script"):
+                            if c_hash:
+                                script_cache[c_hash] = c_item
+                            if c_file:
+                                script_cache[c_file] = c_item
+            except Exception:
+                pass
+
+    if state_mgr.is_step_completed("gemini_script") and os.path.exists(recap_script_json_path):
         print(f"⏩ [3/6] Step 'gemini_script' already COMPLETED (cached). Skipping.")
-        if os.path.exists(recap_script_json_path):
-            with open(recap_script_json_path, "r", encoding="utf-8") as f:
-                script_items = json.load(f)
+        with open(recap_script_json_path, "r", encoding="utf-8") as f:
+            script_items = json.load(f)
     else:
-        # Map panel images to their page key
-        page_to_panels = defaultdict(list)
         for idx, img_path in enumerate(panel_images):
+            panel_num = idx + 1
             fname = os.path.basename(img_path)
-            # Find matching page prefix (e.g., page_002 in slice_page_002_001.jpg)
-            match = re.search(r'(page_\d+)', fname)
-            page_key = match.group(1) if match else f"page_{idx+1:03d}"
-            page_to_panels[page_key].append((idx + 1, fname, img_path))
+            panel_ocr = ocr_results.get(fname, {}).get("ocr_text", "")
+            img_md5 = get_file_md5(img_path)
 
-        # Generate 1 script per raw page (or page group) to minimize API calls
-        page_scripts = {}
-        pages_to_process = raw_pages if raw_pages else [panel_images[0]]
-        total_pages_count = len(pages_to_process)
+            # Check if this exact image hash or filename is already in script cache
+            cached = script_cache.get(img_md5) or script_cache.get(fname)
+            if cached and cached.get("script"):
+                print(f"⏩ [AI Script Panel {panel_num}/{total_panels}] Reusing cached AI script for {fname} (image unchanged).", flush=True)
+                script_items.append({
+                    "panel": panel_num,
+                    "file": fname,
+                    "image_path": img_path,
+                    "md5": img_md5,
+                    "ocr_text": panel_ocr,
+                    "script": cached["script"],
+                    "summary": cached.get("summary", f"Panel {panel_num} scene.")
+                })
+                continue
 
-        for p_idx, page_img_path in enumerate(pages_to_process):
-            p_num = p_idx + 1
-            pfname = os.path.basename(page_img_path)
-            match = re.search(r'(page_\d+)', pfname)
-            page_key = match.group(1) if match else f"page_{p_num:03d}"
-
-            # Combine OCR dialogue for all slices in this page
-            combined_ocr = []
-            for panel_num, fname, img_p in page_to_panels.get(page_key, []):
-                t = ocr_results.get(fname, {}).get("ocr_text", "")
-                if t:
-                    combined_ocr.append(t)
-            page_ocr_text = " ".join(combined_ocr)
-
-            print(f"  [AI Script Page {p_num}/{total_pages_count}] Analyzing {pfname}...", flush=True)
+            print(f"  [AI Script Panel {panel_num}/{total_panels}] Analyzing {fname}...", flush=True)
             script_data = generate_script_for_page(
-                image_path=page_img_path,
-                page_num=p_num,
-                total_pages=total_pages_count,
-                ocr_text=page_ocr_text,
+                image_path=img_path,
+                page_num=panel_num,
+                total_pages=total_panels,
+                ocr_text=panel_ocr,
                 custom_prompt=custom_prompt,
                 mode=mode
             )
 
-            narrator_text = script_data.get("narrator_text", "")
-            page_scripts[page_key] = narrator_text
-
-        # Distribute page scripts across sliced panel clips
-        for idx, img_path in enumerate(panel_images):
-            panel_num = idx + 1
-            fname = os.path.basename(img_path)
-            match = re.search(r'(page_\d+)', fname)
-            page_key = match.group(1) if match else f"page_{panel_num:03d}"
-            panel_ocr = ocr_results.get(fname, {}).get("ocr_text", "")
-
-            script_text = page_scripts.get(page_key, f"Kim Seonwoo reacts to panel {panel_num}.")
+            script_text = script_data.get("narrator_text", "")
             script_items.append({
                 "panel": panel_num,
                 "file": fname,
                 "image_path": img_path,
+                "md5": img_md5,
                 "ocr_text": panel_ocr,
                 "script": script_text,
-                "summary": f"Panel {panel_num} scene."
+                "summary": script_data.get("page_summary", f"Panel {panel_num} scene.")
             })
+
+        # Cache generated script items to disk immediately
+        with open(cache_json_path, "w", encoding="utf-8") as f:
+            json.dump(script_items, f, indent=2, ensure_ascii=False)
 
         state_mgr.mark_step_completed("gemini_script")
 
