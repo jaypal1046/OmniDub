@@ -1,0 +1,20 @@
+[
+  {
+    "index": 1,
+    "filename": "test_manhwa_tall_p01.png",
+    "y_start": 596,
+    "y_end": 1371,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 775
+  },
+  {
+    "index": 2,
+    "filename": "test_manhwa_tall_p02.png",
+    "y_start": 1537,
+    "y_end": 2010,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 473
+  }
+]
