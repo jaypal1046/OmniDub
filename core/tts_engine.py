@@ -206,10 +206,20 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
                 try:
                     clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
                     if len(clip) > duration_ms and duration_ms > 200:
-                        speed_ratio = min(len(clip) / duration_ms, 2.0)
+                        target_speed = len(clip) / duration_ms
+                        # Chain atempo filters if target_speed > 2.0 (FFmpeg limit per atempo filter)
+                        atempo_filters = []
+                        rem_speed = target_speed
+                        while rem_speed > 2.0:
+                            atempo_filters.append("atempo=2.0")
+                            rem_speed /= 2.0
+                        if rem_speed > 1.0:
+                            atempo_filters.append(f"atempo={rem_speed:.4f}")
+                        filter_str = ",".join(atempo_filters) if atempo_filters else "anull"
+
                         proc = await asyncio.create_subprocess_exec(
                             "ffmpeg", "-y", "-i", raw_path,
-                            "-filter:a", f"atempo={speed_ratio:.4f}",
+                            "-filter:a", filter_str,
                             adj_path,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL

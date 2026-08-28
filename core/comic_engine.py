@@ -3,7 +3,7 @@ import json
 import tempfile
 from core.manhwa_downloader import download_webtoon_url
 from core.comic_pdf import load_comic_images
-from core.manhwa_slicer import process_manhwa_images
+from core.manhwa_slicer_v2 import process_manhwa_images_v2
 from core.comic_ocr import extract_ocr_text_from_panel
 from core.comic_script import generate_script_for_page
 from core.comic_animator import generate_page_tts, build_ken_burns_video_segment, concatenate_video_segments
@@ -42,7 +42,7 @@ def generate_comic_recap(input_path_or_url, output_mp3_or_mp4, api_key=None, voi
             raw_image_paths = load_comic_images(input_path_or_url, temp_dir)
 
         # STEP 2: SLICE VERTICAL MANHWA STRIPS
-        image_paths = process_manhwa_images(raw_image_paths, temp_dir)
+        image_paths = process_manhwa_images_v2(raw_image_paths, temp_dir)
         total_pages = len(image_paths)
 
         if total_pages == 0:

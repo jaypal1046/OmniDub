@@ -235,15 +235,17 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
         os.makedirs(seg_dir, exist_ok=True)
         concat_file = os.path.join(temp_dir, "concat_list.txt")
 
-        # Combine adjacent unstretched segments to reduce total segment count
+        # Combine adjacent unstretched segments (ratio == 1.0) to reduce total segment count
         merged_segments = []
         for seg in video_segments:
             if seg["orig_end_ms"] <= seg["orig_start_ms"]:
                 continue
 
-            if merged_segments and merged_segments[-1]["ratio"] <= 1.01 and seg["ratio"] <= 1.01:
+            if merged_segments and abs(merged_segments[-1]["ratio"] - 1.0) <= 0.01 and abs(seg["ratio"] - 1.0) <= 0.01:
                 merged_segments[-1]["orig_end_ms"] = max(merged_segments[-1]["orig_end_ms"], seg["orig_end_ms"])
                 merged_segments[-1]["target_dur_ms"] += seg["target_dur_ms"]
+                merged_segments[-1]["orig_dur_ms"] = merged_segments[-1]["orig_end_ms"] - merged_segments[-1]["orig_start_ms"]
+                merged_segments[-1]["ratio"] = 1.0
             else:
                 merged_segments.append(dict(seg))
 
@@ -265,7 +267,7 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
             if abs(ratio - 1.0) <= 0.01:
                 vf_str = "null"
             else:
-                vf_str = f"setpts={ratio:.4f}*PTS"
+                vf_str = f"setpts={ratio:.6f}*PTS"
 
             cmd = [
                 "ffmpeg", "-y",
@@ -275,6 +277,7 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
                 "-vf", vf_str,
                 "-an",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+                "-avoid_negative_ts", "make_zero",
                 "-threads", "1",
                 seg_out
             ]

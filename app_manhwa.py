@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.state_manager import StateManager, extract_video_id
 from core.manhwa_downloader import download_webtoon_url
 from core.comic_pdf import load_comic_images
-from core.manhwa_slicer import process_manhwa_images
+from core.manhwa_slicer_v2 import process_manhwa_images_v2
 from core.comic_ocr import extract_ocr_text_from_panel
 from core.comic_script import generate_script_for_page
 from core.comic_animator import generate_page_tts, build_ken_burns_video_segment, concatenate_video_segments, get_audio_duration_sec
@@ -101,13 +101,19 @@ def process_manhwa_recap_project(source_input, project_name=None, voice="en-US-C
             raw_images = copied_raw
 
         # Slice tall vertical strips into OpenCV viewport frames & trim blank borders
-        panel_images = process_manhwa_images(raw_images, images_dir)
+        panel_images = process_manhwa_images_v2(raw_images, images_dir)
         state_mgr.mark_step_completed("download", result_files=panel_images)
 
     # Collect sliced panel images (excluding raw strips)
     panel_images = []
-    sliced_subfolder = os.path.join(images_dir, "manhwa_slices")
-    search_target = sliced_subfolder if (os.path.exists(sliced_subfolder) and len(os.listdir(sliced_subfolder)) > 0) else images_dir
+    sliced_subfolder_v2 = os.path.join(images_dir, "manhwa_slices_v2")
+    sliced_subfolder_v1 = os.path.join(images_dir, "manhwa_slices")
+    if os.path.exists(sliced_subfolder_v2) and len(os.listdir(sliced_subfolder_v2)) > 0:
+        search_target = sliced_subfolder_v2
+    elif os.path.exists(sliced_subfolder_v1) and len(os.listdir(sliced_subfolder_v1)) > 0:
+        search_target = sliced_subfolder_v1
+    else:
+        search_target = images_dir
 
     for root, _, files in os.walk(search_target):
         for f in sorted(files):

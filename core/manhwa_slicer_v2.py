@@ -197,7 +197,7 @@ def detect_panel_boundaries_v2(image_path: str, output_dir: Optional[str] = None
         edge_density = compute_row_edge_density(gray_cropped)
         
         # Per-row color variance
-        row_color_var = np.var(saturation, axis=1) + np.var(value, axis=1)
+        row_color_var = np.var(saturation_channel, axis=1) + np.var(value_channel, axis=1)
         
         # Per-row intensity variance (alternative to edge density)
         row_intensity_var = np.var(gray_cropped, axis=1)
@@ -388,6 +388,12 @@ def process_manhwa_images_v2(image_paths: List[str], temp_dir: str) -> List[str]
         processed_paths.extend(result_paths)
     
     return processed_paths
+
+
+# Backward-compatibility function aliases
+process_manhwa_images = process_manhwa_images_v2
+slice_manhwa_strip = slice_manhwa_strip_v2
+slice_strip = slice_strip_v2
 
 
 if __name__ == "__main__":
