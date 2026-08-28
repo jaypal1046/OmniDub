@@ -47,7 +47,8 @@ def get_translated_subtitle_path(project_dir):
     return None
 
 def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 
-                          source_lang="Chinese", bgm_volume=0.4, workers=10, 
+                          source_lang="Chinese", target_lang=None, auto_translate=False,
+                          bgm_volume=0.4, workers=10, 
                           burn_subtitles=False, force=False, pause_after_transcribe=True,
                           auto_continue=False, model="medium", device=None, mode=1,
                           compute_type=None, vad_filter=True, batched=True, threads=None):
@@ -107,9 +108,25 @@ def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeura
         bgm_path = separate_bgm(audio_path, project_dir, device=device)
         state_mgr.mark_step_completed("separate_bgm", [bgm_path])
 
-    # PAUSE FOR SUBTITLE TRANSLATION CHECK
+    # Step 3.5: Gemini Timing-Aware Translation (if requested or enabled)
     translated_sub_input = get_translated_subtitle_path(project_dir)
-    if transcribe_just_completed and pause_after_transcribe and not auto_continue:
+    if (auto_translate or target_lang) and not translated_sub_input:
+        gemini_vtt = os.path.join(project_dir, "Translated", f"gemini_{target_lang.lower()}.vtt")
+        if state_mgr.is_step_completed("gemini_translate", [gemini_vtt]):
+            print(f"\n⏩ Gemini Translation to '{target_lang}' already COMPLETED (cached).")
+            translated_sub_input = gemini_vtt
+        else:
+            try:
+                from core.translator import translate_subtitles_with_gemini
+                translated_sub_input = translate_subtitles_with_gemini(
+                    orig_sub_path, gemini_vtt, target_lang=target_lang, source_lang=source_lang
+                )
+                state_mgr.mark_step_completed("gemini_translate", [gemini_vtt])
+            except Exception as e:
+                print(f"⚠️ Gemini translation encountered an error: {e}")
+
+    # PAUSE FOR SUBTITLE TRANSLATION CHECK (if auto_translate was not enabled and pause is set)
+    if transcribe_just_completed and pause_after_transcribe and not auto_continue and not auto_translate:
         state_mgr.set_project_status("AWAITING_TRANSLATION")
         print("\n=========================================================================")
         print("⏸️ PIPELINE PAUSED FOR SUBTITLE TRANSLATION")
@@ -169,6 +186,8 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--threads", type=int, default=None, help="Number of threads for CPU inference")
     parser.add_argument("-mode", "--mode", type=int, choices=[1, 2, 3, 4], default=1,
                         help="Output mode: 1=Video+Audio (DEFAULT), 2=Video+Audio+BGM, 3=Video+Audio+Transcript, 4=Video+Audio+BGM+Transcript")
+    parser.add_argument("--target-lang", default=None, help="Target language for Gemini dubbing translation (e.g. Hindi, English, Spanish)")
+    parser.add_argument("--translate", action="store_true", help="Automatically translate subtitles using Gemini")
     parser.add_argument("--bgm-volume", type=float, default=0.4, help="BGM volume multiplier (0.0 to 1.0)")
     parser.add_argument("--burn-subtitles", action="store_true", help="Burn subtitles onto the final video (maps to Mode 3/4)")
     parser.add_argument("--force", action="store_true", help="Force re-run all steps without using cached state")
@@ -182,6 +201,8 @@ if __name__ == "__main__":
         project_name=args.project_name,
         voice=args.voice,
         source_lang=args.lang,
+        target_lang=args.target_lang,
+        auto_translate=args.translate or (args.target_lang is not None),
         bgm_volume=args.bgm_volume,
         workers=args.workers,
         burn_subtitles=args.burn_subtitles,

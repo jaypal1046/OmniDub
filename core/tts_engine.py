@@ -205,8 +205,26 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
 
                 try:
                     clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
+                    
+                    # Duration Controller Check: If speech is > 1.10x longer than duration budget, trigger Gemini Rewrite
+                    if len(clip) > (duration_ms * 1.10) and duration_ms > 500:
+                        try:
+                            from core.translator import rewrite_cue_for_duration
+                            target_sec = duration_ms / 1000.0
+                            shortened_text = await asyncio.to_thread(rewrite_cue_for_duration, text, target_sec)
+                            if shortened_text and shortened_text != text:
+                                # Re-synthesize TTS with shortened text
+                                comm = edge_tts.Communicate(shortened_text, voice)
+                                await comm.save(raw_path)
+                                if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
+                                    clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
+                        except Exception as rewrite_err:
+                            pass
+
+                    # Fine timing adjustment: Apply mild FFmpeg atempo capped between 0.90x and 1.10x
                     if len(clip) > duration_ms and duration_ms > 200:
-                        speed_ratio = min(len(clip) / duration_ms, 2.0)
+                        # Strictly cap atempo speed ratio at 1.10x max to maintain natural speech
+                        speed_ratio = min(len(clip) / duration_ms, 1.10)
                         proc = await asyncio.create_subprocess_exec(
                             "ffmpeg", "-y", "-i", raw_path,
                             "-filter:a", f"atempo={speed_ratio:.4f}",
