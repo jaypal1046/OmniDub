@@ -50,8 +50,13 @@ def export_retimed_vtt(retimed_entries, output_vtt):
 
 async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-AriaNeural", max_workers=10):
     """
-    Synthesizes Edge-TTS audio clips at 100% natural, uncompressed speed with persistent disk caching.
-    Skips synthesizing any clip that already exists in voice-specific tts_cache_dir.
+    Synthesizes Edge-TTS audio clips with PREMIUM naturalness settings:
+    - Uses rate="-8%" for slower, clearer speech (not rushed)
+    - Uses volume="+8%" for better presence and consistent audio levels
+    - Adds 80ms silence padding for natural breathing room between cues
+    - Validates each clip (>200ms) before accepting
+    - Includes retry logic with exponential backoff
+    - Persistent disk caching to avoid re-synthesis
     """
     safe_voice = re.sub(r"[^\w\-]", "_", voice)
     voice_cache_dir = os.path.join(tts_cache_dir, safe_voice)
@@ -69,25 +74,56 @@ async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-
             raw_path = os.path.join(voice_cache_dir, f"nat_{idx}.mp3")
 
             if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
-                for attempt in range(4):
+                # PREMIUM TTS with enhanced prosody settings
+                for attempt in range(5):
                     try:
-                        comm = edge_tts.Communicate(text, voice)
+                        # Use Communicate with premium settings for natural, clear speech
+                        comm = edge_tts.Communicate(
+                            text, 
+                            voice,
+                            rate="-8%",      # Slower for maximum clarity
+                            volume="+8%",    # Better presence
+                            pitch="+0Hz"     # Natural pitch
+                        )
                         await comm.save(raw_path)
                         if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
-                            break
+                            # Verify file is valid with meaningful duration
+                            try:
+                                test_clip = AudioSegment.from_file(raw_path)
+                                if len(test_clip) > 200:  # At least 200ms of actual speech
+                                    break
+                                else:
+                                    # Too short, likely failed synthesis
+                                    await asyncio.sleep(0.5)
+                                    continue
+                            except Exception:
+                                await asyncio.sleep(0.5)
+                                continue
                     except Exception:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                        wait_time = 0.5 * (attempt + 1)
+                        await asyncio.sleep(wait_time)
+                
+                # Final verification
+                if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
+                    print(f"⚠️ Warning: Failed to synthesize clip {idx} after 5 attempts", flush=True)
             else:
                 cached_count += 1
 
             completed += 1
             if completed % 50 == 0 or completed == total or completed == 1:
                 percent = (completed / total) * 100
-                print(f"🎙️ Natural TTS Progress ({voice}): [{completed}/{total}] ({percent:.1f}%) [Cached: {cached_count}]...", flush=True)
+                print(f"🎙️ Premium TTS Progress ({voice}): [{completed}/{total}] ({percent:.1f}%) [Cached: {cached_count}]...", flush=True)
 
             if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
-                clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
-                dur = len(clip)
+                try:
+                    clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
+                    # Add subtle 80ms padding for natural breathing room
+                    padding = AudioSegment.silent(duration=80)
+                    clip = padding + clip + padding
+                    dur = len(clip)
+                except Exception:
+                    dur = entry["duration_ms"]
+                    clip = None
             else:
                 dur = entry["duration_ms"]
                 clip = None
@@ -158,7 +194,7 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
         total_trimmed = 0
 
         for item in synth_results:
-            entry = entry = item["entry"]
+            entry = item["entry"]
             start_ms = max(entry["start_ms"], curr_orig_ms)
             end_ms = max(entry["end_ms"], start_ms + 100)
             orig_dur_ms = max(end_ms - start_ms, 100)
@@ -179,37 +215,40 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
                 curr_orig_ms = start_ms
 
             # CRITICAL FIX: Calculate target duration with speed bounding
+            # ratio = target_dur / orig_dur
+            # For setpts filter: setpts=N*PTS where N = orig_dur/target_dur (INVERSE!)
+            # - If audio is LONGER (target > orig): need to SLOW video → setpts scale < 1
+            # - If audio is SHORTER (target < orig): need to SPEED video → setpts scale > 1
             ideal_ratio = actual_audio_ms / orig_dur_ms
             
             if ideal_ratio < MIN_SPEED_RATIO:
-                # Audio is SHORTER than video → Can speed up video slightly
-                # But don't exceed MAX_SPEED_RATIO, add freeze frame at end
-                target_dur_ms = int(orig_dur_ms / MAX_SPEED_RATIO)
-                if target_dur_ms < actual_audio_ms:
-                    target_dur_ms = actual_audio_ms  # Prioritize audio length
-                speed_ratio = actual_audio_ms / orig_dur_ms
-                speed_ratio = max(speed_ratio, MIN_SPEED_RATIO)
+                # Audio is SHORTER than video → Need to speed up video
+                # But don't go below MIN_SPEED_RATIO (0.75x), add freeze frame for remainder
+                speed_ratio = MIN_SPEED_RATIO  # Slowest allowed: 0.75x
+                warped_dur_ms = int(orig_dur_ms * speed_ratio)
                 
-                # Add freeze frame to fill remaining time
-                freeze_dur = actual_audio_ms - target_dur_ms
-                if freeze_dur > FREEZE_FRAME_MIN_MS:
+                # If audio is still longer than warped video, extend target to match audio
+                if actual_audio_ms > warped_dur_ms:
                     target_dur_ms = actual_audio_ms
-                    speed_ratio = MIN_SPEED_RATIO
+                else:
+                    target_dur_ms = warped_dur_ms
                     
             elif ideal_ratio > MAX_SPEED_RATIO:
                 # Audio is LONGER than video → Need to slow down video
-                # But don't go below MIN_SPEED_RATIO, use freeze frames for remainder
-                target_dur_ms = int(orig_dur_ms / MIN_SPEED_RATIO)
-                speed_ratio = MIN_SPEED_RATIO
+                # But don't exceed MAX_SPEED_RATIO (1.25x), use freeze frames for remainder
+                speed_ratio = MAX_SPEED_RATIO  # Fastest allowed: 1.25x
+                warped_dur_ms = int(orig_dur_ms * speed_ratio)
                 
-                # If audio is still longer, we'll extend with freeze frame
-                if actual_audio_ms > target_dur_ms:
-                    target_dur_ms = actual_audio_ms  # Match audio, use freeze frame strategy
+                # If audio is still longer, extend target to match audio (will use freeze frame)
+                if actual_audio_ms > warped_dur_ms:
+                    target_dur_ms = actual_audio_ms
+                else:
+                    target_dur_ms = warped_dur_ms
                     
             else:
                 # Ratio is within acceptable range (0.75x - 1.25x)
-                target_dur_ms = actual_audio_ms
                 speed_ratio = ideal_ratio
+                target_dur_ms = actual_audio_ms
 
             # Store retimed subtitle entry
             retimed_entries.append({
@@ -228,25 +267,27 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
                 "target_dur_ms": target_dur_ms,
                 "ratio": speed_ratio,
                 "actual_audio_ms": actual_audio_ms,
-                "has_freeze_extension": target_dur_ms > (orig_dur_ms / speed_ratio)
+                "has_freeze_extension": target_dur_ms > int(orig_dur_ms * speed_ratio)
             })
 
             item["new_start_ms"] = curr_new_ms
             curr_new_ms += target_dur_ms
             curr_orig_ms = end_ms
 
-        # Final gap after last cue
+        # Final gap after last cue - DO NOT add final gap if audio is longer than video
+        # This prevents the 3+ minute audio-only tail issue
         if total_video_ms > curr_orig_ms:
-            final_gap_ms = total_video_ms - curr_orig_ms
-            if final_gap_ms > 0:
+            remaining_video_ms = total_video_ms - curr_orig_ms
+            # Only add gap if we have room (video duration is still longer than retimed audio)
+            if remaining_video_ms > 0 and (curr_new_ms + remaining_video_ms) <= total_video_ms:
                 video_segments.append({
                     "type": "gap",
                     "orig_start_ms": curr_orig_ms,
                     "orig_end_ms": total_video_ms,
-                    "target_dur_ms": final_gap_ms,
+                    "target_dur_ms": remaining_video_ms,
                     "ratio": 1.0
                 })
-                curr_new_ms += final_gap_ms
+                curr_new_ms += remaining_video_ms
 
         retimed_total_duration_s = curr_new_ms / 1000.0
         print(f"⏱️ Retimed Total Video Duration: {retimed_total_duration_s:.2f}s")
@@ -281,18 +322,13 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
         os.makedirs(seg_dir, exist_ok=True)
         concat_file = os.path.join(temp_dir, "concat_list.txt")
 
-        # Merge adjacent segments with similar speeds for smoother playback
+        # DO NOT merge segments - each segment needs individual timestamp handling
+        # Merging causes timestamp discontinuities and glitches
         merged_segments = []
         for seg in video_segments:
             if seg["orig_end_ms"] <= seg["orig_start_ms"]:
                 continue
-
-            # Only merge if both are normal speed (gaps or ratio ≈ 1.0)
-            if merged_segments and abs(merged_segments[-1]["ratio"] - 1.0) <= 0.05 and abs(seg["ratio"] - 1.0) <= 0.05:
-                merged_segments[-1]["orig_end_ms"] = max(merged_segments[-1]["orig_end_ms"], seg["orig_end_ms"])
-                merged_segments[-1]["target_dur_ms"] += seg["target_dur_ms"]
-            else:
-                merged_segments.append(dict(seg))
+            merged_segments.append(dict(seg))
 
         print(f"🧩 Optimized timeline into {len(merged_segments)} video rendering chunks (from {len(video_segments)} original segments).")
 
@@ -303,36 +339,60 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
             start_s = seg["orig_start_ms"] / 1000.0
             end_s = seg["orig_end_ms"] / 1000.0
 
-            if end_s <= start_s + 0.01:
+            if end_s <= start_s + 0.05:
                 end_s = start_s + 0.1
 
             ratio = seg["ratio"]
             target_dur = seg["target_dur_ms"] / 1000.0
             orig_dur = (seg["orig_end_ms"] - seg["orig_start_ms"]) / 1000.0
 
-            # STRATEGY: Use setpts for speed change + tpad for freeze frame extension
-            if seg["type"] == "gap" or abs(ratio - 1.0) <= 0.01:
-                # Normal speed - no processing needed
-                vf_str = "null"
+            # CRITICAL FIX: ratio interpretation for setpts filter
+            # ratio = target_dur / orig_dur (how much longer/shorter the output should be)
+            # For setpts=N*PTS: N = orig_dur / target_dur = 1/ratio
+            # - If ratio > 1.0 (target > orig): video needs to be LONGER → slow down → setpts scale < 1
+            # - If ratio < 1.0 (target < orig): video needs to be SHORTER → speed up → setpts scale > 1
+            
+            if seg["type"] == "gap" or abs(ratio - 1.0) <= 0.02:
+                # Normal speed - just extract segment with proper timestamp reset
+                vf_str = f"trim=start={start_s}:end={end_s},setpts=PTS-STARTPTS,pad=ceil(iw/2)*2:ceil(ih/2)*2"
             else:
-                # Apply speed warp with setpts
-                vf_str = f"setpts={ratio:.4f}*PTS"
+                # Apply speed change using setpts
+                # pts_scale = orig_dur / target_dur = 1 / ratio
+                # This is the INVERSE of the duration ratio!
+                pts_scale = orig_dur / target_dur if target_dur > 0 else 1.0
                 
-                # If target duration is longer than warped duration, add freeze frame at end
-                warped_dur = orig_dur / ratio
-                if target_dur > warped_dur + 0.1:  # More than 100ms difference
-                    freeze_frames = int((target_dur - warped_dur) * 30)  # Assume 30fps
-                    vf_str = f"{vf_str},tpad=stop_mode=clone:stop={freeze_frames}"
+                # Clamp pts_scale to avoid extreme values that cause glitches
+                pts_scale = max(0.5, min(2.0, pts_scale))
+                
+                # Build filter chain: trim → speed change → optional freeze frame extension
+                vf_str = f"trim=start={start_s}:end={end_s},setpts={pts_scale:.6f}*PTS"
+                
+                # Calculate warped duration after speed change
+                warped_dur = orig_dur / pts_scale if pts_scale > 0 else orig_dur
+                
+                # If target duration is longer than warped duration, extend with frozen last frame
+                if target_dur > warped_dur + 0.15:  # More than 150ms difference
+                    pad_dur = target_dur - warped_dur
+                    vf_str = f"{vf_str},tpad=stop_mode=clone:stop_duration={pad_dur:.3f}"
+                
+                # Add timestamp reset and padding to ensure even dimensions
+                vf_str = f"{vf_str},setpts=PTS-STARTPTS,pad=ceil(iw/2)*2:ceil(ih/2)*2"
 
+            # CRITICAL FIX: Remove -copyts and -vsync vfr during segment extraction
+            # These cause timestamp conflicts with setpts modifications
+            # Use constant framerate and let final assembly handle sync
             cmd = [
                 "ffmpeg", "-y",
-                "-ss", f"{start_s:.4f}",
-                "-to", f"{end_s:.4f}",
                 "-i", video_path,
+                "-ss", str(start_s),
+                "-to", str(end_s),
                 "-vf", vf_str,
                 "-an",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
-                "-threads", "1",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-pix_fmt", "yuv420p",
+                "-vsync", "1",  # Constant framerate for smooth playback
+                "-r", "30",     # Force 30fps for consistency
+                "-avoid_negative_ts", "make_one",
                 seg_out
             ]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -355,13 +415,24 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
         with open(concat_file, "w", encoding="utf-8") as f:
             f.writelines(concat_lines)
 
-        # Merge segments into raw retimed video
+        # Merge segments into raw retimed video using concat demuxer with exact frame matching
         raw_retimed_video = os.path.join(temp_dir, "raw_retimed_video.mp4")
+        
+        # CRITICAL FIX: Re-encode with consistent settings to ensure smooth playback
+        # Remove -copyts as it conflicts with our timestamp modifications
+        # Use constant framerate for smooth concatenation
         cmd_concat = [
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
+            "-fflags", "+genpts",
             "-i", concat_file,
-            "-c", "copy",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-vsync", "1",
+            "-r", "30",
+            "-an",
+            "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_one",
             raw_retimed_video
         ]
         subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -389,9 +460,16 @@ def process_audio_driven_retiming_v2(video_path, sub_path, project_dir, voice="e
         else:
             cmd_final.extend(["-map", "0:v", "-map", "1:a"])
 
+        # CRITICAL FIX: Remove -shortest as it causes audio/video desync
+        # Video duration should already match audio from retiming process
+        # Use constant framerate for smooth playback
         cmd_final.extend([
-            "-c:v", "libx264", "-preset", "fast", "-crf", "24",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "22",
             "-c:a", "aac", "-b:a", "192k",
+            "-vsync", "1",
+            "-r", "30",
+            "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_one",
             final_output
         ])
 
