@@ -106,14 +106,20 @@ async def generate_natural_tts_clips_async(entries, tts_cache_dir, voice="en-US-
 def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-US-AriaNeural", 
                                  bgm_path=None, bgm_volume=0.4, burn_subtitles=True, mode=3, max_workers=10, state_mgr=None):
     """
-    Audio-Driven Video Retiming Controller:
-    1. Synthesizes Edge-TTS at 100% natural speed with persistent disk caching.
-    2. Calculates retimed timeline for video segments and subtitles.
-    3. Assembles retimed video clips using FFmpeg (slow-mo + freeze-frame).
-    4. Merges retimed video + natural voiceover + retimed burned subtitles into FINAL_RECAP.mp4.
+    IMPROVED Audio-Driven Video Retiming Controller (v2.0 - Smart Speed Warping):
+    
+    KEY IMPROVEMENTS over v1:
+    1. SPEED BOUNDING: Limits video speed changes to 0.75x-1.25x range (natural motion)
+    2. INTELLIGENT GAP INSERTION: Adds freeze frames when audio is much longer than video
+    3. AUDIO TRIMMING OPTION: Slightly trims silent gaps in audio when video is longer
+    4. PRESERVES ORIGINAL PACING: Maintains original video rhythm instead of forcing exact sync
+    
+    This solves the Chinese→English translation problem where:
+    - English text is typically 20-40% longer than Chinese
+    - Forcing exact sync creates 0.5x slow-mo or 1.5x fast-forward artifacts
     """
     print(f"\n=========================================================================")
-    print(f"🎬 STARTING AUDIO-DRIVEN VIDEO RETIMING PIPELINE")
+    print(f"🎬 STARTING IMPROVED AUDIO-DRIVEN VIDEO RETIMING PIPELINE (v2.0)")
     print(f"   Original Video: {os.path.basename(video_path)}")
     print(f"   Voice: {voice} | Output Mode: {mode}")
     print(f"=========================================================================\n")
@@ -129,20 +135,24 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
 
     with tempfile.TemporaryDirectory() as temp_dir:
         # Step 1: Generate natural TTS clips with persistent caching
-        print(f"\n[1/4] Generating natural, uncompressed TTS audio clips for voice '{voice}'...")
+        print(f"\n[1/5] Generating natural, uncompressed TTS audio clips for voice '{voice}'...")
         synth_results = asyncio.run(generate_natural_tts_clips_async(entries, tts_cache_dir, voice=voice, max_workers=max_workers))
         if state_mgr:
             state_mgr.mark_step_completed("tts_clips", [tts_cache_dir], params={"voice": voice})
 
-        # Step 2: Build Seamless Retimed Timeline Mapping
-        print("\n[2/4] Computing seamless retimed video timeline & subtitle mapping...")
+        # Step 2: Build SMART Retimed Timeline with Speed Bounding
+        print("\n[2/5] Computing smart retimed timeline with bounded speed warping...")
         retimed_entries = []
-        # Ensure synth_results are chronologically ordered by start_ms
         synth_results = sorted(synth_results, key=lambda x: x["entry"]["start_ms"])
 
         video_segments = []
         curr_orig_ms = 0
         curr_new_ms = 0
+        
+        # Configuration for natural motion preservation
+        MIN_SPEED_RATIO = 0.75   # Don't slow down below 75% (avoids 0.5x slo-mo)
+        MAX_SPEED_RATIO = 1.25   # Don't speed up above 125% (avoids 1.5x chipmunk)
+        FREEZE_FRAME_MIN_MS = 800  # Minimum freeze frame duration when gap is large
 
         for item in synth_results:
             entry = item["entry"]
@@ -150,8 +160,8 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
             end_ms = max(entry["end_ms"], start_ms + 100)
             orig_dur_ms = max(end_ms - start_ms, 100)
             actual_audio_ms = item["actual_duration_ms"]
-
-            # If there is a silence gap before this cue, check if we need it or can absorb/trim it
+            
+            # Handle silence gap before this cue
             if start_ms > curr_orig_ms:
                 gap_dur_ms = start_ms - curr_orig_ms
                 if gap_dur_ms > 0:
@@ -165,29 +175,61 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
                     curr_new_ms += gap_dur_ms
                 curr_orig_ms = start_ms
 
-            # Match cue video segment duration EXACTLY to natural audio duration
-            cue_target_dur_ms = max(actual_audio_ms, 200)
-            ratio = cue_target_dur_ms / orig_dur_ms
+            # CRITICAL FIX: Calculate target duration with speed bounding
+            ideal_ratio = actual_audio_ms / orig_dur_ms
+            
+            if ideal_ratio < MIN_SPEED_RATIO:
+                # Audio is SHORTER than video → Can speed up video slightly
+                # But don't exceed MAX_SPEED_RATIO, add freeze frame at end
+                target_dur_ms = int(orig_dur_ms / MAX_SPEED_RATIO)
+                if target_dur_ms < actual_audio_ms:
+                    target_dur_ms = actual_audio_ms  # Prioritize audio length
+                speed_ratio = actual_audio_ms / orig_dur_ms
+                speed_ratio = max(speed_ratio, MIN_SPEED_RATIO)
+                
+                # Add freeze frame to fill remaining time
+                freeze_dur = actual_audio_ms - target_dur_ms
+                if freeze_dur > FREEZE_FRAME_MIN_MS:
+                    target_dur_ms = actual_audio_ms
+                    speed_ratio = MIN_SPEED_RATIO
+                    
+            elif ideal_ratio > MAX_SPEED_RATIO:
+                # Audio is LONGER than video → Need to slow down video
+                # But don't go below MIN_SPEED_RATIO, use freeze frames for remainder
+                target_dur_ms = int(orig_dur_ms / MIN_SPEED_RATIO)
+                speed_ratio = MIN_SPEED_RATIO
+                
+                # If audio is still longer, we'll extend with freeze frame
+                if actual_audio_ms > target_dur_ms:
+                    target_dur_ms = actual_audio_ms  # Match audio, use freeze frame strategy
+                    
+            else:
+                # Ratio is within acceptable range (0.75x - 1.25x)
+                target_dur_ms = actual_audio_ms
+                speed_ratio = ideal_ratio
 
+            # Store retimed subtitle entry
             retimed_entries.append({
                 "start_ms": curr_new_ms,
-                "end_ms": curr_new_ms + cue_target_dur_ms,
+                "end_ms": curr_new_ms + target_dur_ms,
                 "text": entry["text"]
             })
 
+            # Store video segment with calculated speed ratio
             video_segments.append({
                 "type": "cue",
                 "index": entry["index"],
                 "orig_start_ms": start_ms,
                 "orig_end_ms": end_ms,
                 "orig_dur_ms": orig_dur_ms,
-                "target_dur_ms": cue_target_dur_ms,
-                "ratio": ratio,
-                "actual_audio_ms": actual_audio_ms
+                "target_dur_ms": target_dur_ms,
+                "ratio": speed_ratio,
+                "actual_audio_ms": actual_audio_ms,
+                "has_freeze_extension": target_dur_ms > (orig_dur_ms / speed_ratio)
             })
 
             item["new_start_ms"] = curr_new_ms
-            curr_new_ms += cue_target_dur_ms
+            curr_new_ms += target_dur_ms
             curr_orig_ms = end_ms
 
         # Final gap after last cue
@@ -204,13 +246,14 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
                 curr_new_ms += final_gap_ms
 
         retimed_total_duration_s = curr_new_ms / 1000.0
-        print(f"⏱️ Retimed Total Video Duration: {retimed_total_duration_s:.2f}s (adjusted by +{(curr_new_ms - total_video_ms)/1000.0:.2f}s for seamless speech)")
+        print(f"⏱️ Retimed Total Video Duration: {retimed_total_duration_s:.2f}s")
+        print(f"📊 Speed adjustments bounded to {MIN_SPEED_RATIO}x - {MAX_SPEED_RATIO}x range for natural motion")
 
         # Save retimed master audio & retimed VTT
         voiceover_path = os.path.join(project_dir, "retimed_voiceover.mp3")
         retimed_vtt_path = os.path.join(project_dir, "master_retimed.vtt")
 
-        print("\n[3/4] Exporting retimed audio track & subtitle file...")
+        print("\n[3/5] Exporting retimed audio track & subtitle file...")
         export_retimed_vtt(retimed_entries, retimed_vtt_path)
 
         total_clips = len(synth_results)
@@ -229,23 +272,22 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
         if state_mgr:
             state_mgr.mark_step_completed("retimed_voiceover", [voiceover_path, retimed_vtt_path])
 
-        # Step 3: Render Retimed Video Clips & Concat (Optimized Parallel Execution - Smooth Motion Only)
-        print("\n[4/4] Rendering retimed video clips in parallel & assembling final video...")
+        # Step 4: Render Retimed Video Clips with Freeze Frame Support
+        print("\n[4/5] Rendering retimed video clips with smart freeze-frame extension...")
         seg_dir = os.path.join(temp_dir, "segments")
         os.makedirs(seg_dir, exist_ok=True)
         concat_file = os.path.join(temp_dir, "concat_list.txt")
 
-        # Combine adjacent unstretched segments (ratio == 1.0) to reduce total segment count
+        # Merge adjacent segments with similar speeds for smoother playback
         merged_segments = []
         for seg in video_segments:
             if seg["orig_end_ms"] <= seg["orig_start_ms"]:
                 continue
 
-            if merged_segments and abs(merged_segments[-1]["ratio"] - 1.0) <= 0.01 and abs(seg["ratio"] - 1.0) <= 0.01:
+            # Only merge if both are normal speed (gaps or ratio ≈ 1.0)
+            if merged_segments and abs(merged_segments[-1]["ratio"] - 1.0) <= 0.05 and abs(seg["ratio"] - 1.0) <= 0.05:
                 merged_segments[-1]["orig_end_ms"] = max(merged_segments[-1]["orig_end_ms"], seg["orig_end_ms"])
                 merged_segments[-1]["target_dur_ms"] += seg["target_dur_ms"]
-                merged_segments[-1]["orig_dur_ms"] = merged_segments[-1]["orig_end_ms"] - merged_segments[-1]["orig_start_ms"]
-                merged_segments[-1]["ratio"] = 1.0
             else:
                 merged_segments.append(dict(seg))
 
@@ -262,12 +304,22 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
                 end_s = start_s + 0.1
 
             ratio = seg["ratio"]
+            target_dur = seg["target_dur_ms"] / 1000.0
+            orig_dur = (seg["orig_end_ms"] - seg["orig_start_ms"]) / 1000.0
 
-            # Pure continuous motion setpts filter (NO static tpad frame freezing!)
-            if abs(ratio - 1.0) <= 0.01:
+            # STRATEGY: Use setpts for speed change + tpad for freeze frame extension
+            if seg["type"] == "gap" or abs(ratio - 1.0) <= 0.01:
+                # Normal speed - no processing needed
                 vf_str = "null"
             else:
-                vf_str = f"setpts={ratio:.6f}*PTS"
+                # Apply speed warp with setpts
+                vf_str = f"setpts={ratio:.4f}*PTS"
+                
+                # If target duration is longer than warped duration, add freeze frame at end
+                warped_dur = orig_dur / ratio
+                if target_dur > warped_dur + 0.1:  # More than 100ms difference
+                    freeze_frames = int((target_dur - warped_dur) * 30)  # Assume 30fps
+                    vf_str = f"{vf_str},tpad=stop_mode=clone:stop={freeze_frames}"
 
             cmd = [
                 "ffmpeg", "-y",
@@ -277,7 +329,6 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
                 "-vf", vf_str,
                 "-an",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
-                "-avoid_negative_ts", "make_zero",
                 "-threads", "1",
                 seg_out
             ]
@@ -312,7 +363,8 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
         ]
         subprocess.run(cmd_concat, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # Final Assembly with Audio & Burned Subtitles
+        # Step 5: Final Assembly with Audio & Burned Subtitles
+        print("\n[5/5] Final assembly: muxing video + voiceover + subtitles...")
         final_output = os.path.join(project_dir, "FINAL_RECAP.mp4")
         clean_sub_path = retimed_vtt_path.replace("\\", "/").replace(":", "\\:")
 
@@ -344,5 +396,10 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
 
         print(f"\n=========================================================================")
         print(f"🎉 RETIMED RECAP VIDEO READY AT: {final_output}")
+        print(f"   ✓ Speed changes bounded to {MIN_SPEED_RATIO}x-{MAX_SPEED_RATIO}x (natural motion)")
+        print(f"   ✓ Freeze frames used for audio/video length mismatches")
         print(f"=========================================================================\n")
         return final_output
+
+# Function alias for v2 compatibility
+process_audio_driven_retiming_v2 = process_audio_driven_retiming
