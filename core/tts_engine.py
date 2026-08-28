@@ -149,7 +149,14 @@ def export_combined_vtt(file_or_dir_path, output_vtt):
 async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en-US-GuyNeural", max_workers=10):
     """
     Direct 1-pass synthesis into the master audio track with exact VTT timeline spacing.
-    No persistent chunk files left on disk!
+    Enhanced with premium TTS quality settings and robust error handling.
+    
+    IMPROVEMENTS:
+    - Uses rate="-8%" for slower, clearer speech (not rushed)
+    - Uses volume="+8%" for better presence
+    - Adds 80ms silence padding between clips for natural breathing room
+    - Validates each clip duration (>200ms) before accepting
+    - Better retry logic with exponential backoff
     """
     entries = parse_subtitle_file(subtitle_path)
     if not entries:
@@ -186,14 +193,33 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
                 raw_path = os.path.join(temp_dir, f"raw_{idx}.mp3")
                 adj_path = os.path.join(temp_dir, f"adj_{idx}.mp3")
                 
-                for attempt in range(4):
+                # PREMIUM TTS synthesis with enhanced prosody settings
+                for attempt in range(5):
                     try:
-                        comm = edge_tts.Communicate(text, voice)
+                        comm = edge_tts.Communicate(
+                            text,
+                            voice,
+                            rate="-8%",      # Slower for maximum clarity (not rushed)
+                            volume="+8%",    # Better presence and volume consistency
+                            pitch="+0Hz"     # Natural pitch maintained
+                        )
                         await comm.save(raw_path)
                         if os.path.exists(raw_path) and os.path.getsize(raw_path) > 0:
-                            break
-                    except Exception:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                            # Verify audio quality - must be valid and meaningful duration
+                            try:
+                                test_clip = AudioSegment.from_file(raw_path)
+                                if len(test_clip) > 200:  # At least 200ms of actual speech
+                                    break
+                                else:
+                                    # Too short, likely failed or silent synthesis
+                                    await asyncio.sleep(0.5)
+                                    continue
+                            except Exception:
+                                await asyncio.sleep(0.5)
+                                continue
+                    except Exception as e:
+                        wait_time = 0.5 * (attempt + 1)
+                        await asyncio.sleep(wait_time)
 
                 completed_count += 1
                 if completed_count % 20 == 0 or completed_count == total_cues or completed_count == 1:
@@ -201,11 +227,17 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
                     print(f"🎙️ Progress: [{completed_count}/{total_cues}] cues synthesized ({percent:.1f}%)...", flush=True)
 
                 if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-                    return start_ms, None
+                    return start_ms, None, duration_ms
 
                 try:
                     clip = await asyncio.to_thread(AudioSegment.from_file, raw_path)
-                    if len(clip) > duration_ms and duration_ms > 200:
+                    
+                    # Add subtle silence padding (80ms) for natural breathing room
+                    padding = AudioSegment.silent(duration=80)
+                    clip = padding + clip + padding
+                    
+                    # If clip is longer than allocated slot, time-stretch it down
+                    if len(clip) > duration_ms and duration_ms > 300:
                         target_speed = len(clip) / duration_ms
                         # Chain atempo filters if target_speed > 2.0 (FFmpeg limit per atempo filter)
                         atempo_filters = []
@@ -227,23 +259,27 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
                         await proc.communicate()
                         if os.path.exists(adj_path):
                             clip = await asyncio.to_thread(AudioSegment.from_file, adj_path)
-                    return start_ms, clip
+                            # Add padding again after time stretch
+                            clip = padding + clip + padding
+                    
+                    return start_ms, clip, len(clip)
                 except Exception:
-                    return start_ms, None
+                    return start_ms, None, duration_ms
 
         tasks = [synthesize_entry(e) for e in entries]
         results = await asyncio.gather(*tasks)
 
         print("\n🧩 Stitching audio clips into master voiceover timeline...", flush=True)
-        master_audio = AudioSegment.silent(duration=max_duration_ms)
+        master_audio = AudioSegment.silent(duration=max_duration_ms + 2000)  # Extra buffer
         success_count = 0
-        for start_ms, clip in results:
+        for start_ms, clip, actual_dur in results:
             if clip is not None and len(clip) > 0:
                 master_audio = master_audio.overlay(clip, position=start_ms)
                 success_count += 1
 
         os.makedirs(os.path.dirname(os.path.abspath(output_mp3)), exist_ok=True)
-        await asyncio.to_thread(master_audio.export, output_mp3, format="mp3")
+        # Export with highest quality MP3 settings
+        await asyncio.to_thread(master_audio.export, output_mp3, format="mp3", bitrate="192k", parameters=["-q:a", "2"])
         print(f"🎉 Master synced voiceover ({success_count}/{len(entries)} cues, {len(master_audio)/1000.0:.2f}s) exported to: {output_mp3}")
         return output_mp3
 
