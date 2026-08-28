@@ -1,0 +1,47 @@
+[
+  {
+    "index": 1,
+    "filename": "test_manhwa_tall_p01.png",
+    "y_start": 0,
+    "y_end": 315,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 315
+  },
+  {
+    "index": 2,
+    "filename": "test_manhwa_tall_p02.png",
+    "y_start": 315,
+    "y_end": 965,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 650
+  },
+  {
+    "index": 3,
+    "filename": "test_manhwa_tall_p03.png",
+    "y_start": 965,
+    "y_end": 1415,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 450
+  },
+  {
+    "index": 4,
+    "filename": "test_manhwa_tall_p04.png",
+    "y_start": 1415,
+    "y_end": 1815,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 400
+  },
+  {
+    "index": 5,
+    "filename": "test_manhwa_tall_p05.png",
+    "y_start": 1815,
+    "y_end": 2300,
+    "cut_source": "scene_grouped_v2",
+    "confidence": 0.95,
+    "segment_height": 485
+  }
+]

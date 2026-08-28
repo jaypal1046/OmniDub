@@ -1,45 +1,30 @@
-# Byte-compiled / optimized / DLL files
+```
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+*.pyd
 
-# Virtual Environments
-.venv/
-venv/
-env/
-ENV/
-
-
-# Output & Project Media Files (Downloaded / Generated media)
+# Output directories
 output/
-*.mp4
-*.wav
-*.m4a
-*.webm
-*.mkv
-*.flv
 
-# Subtitle Working Files
-*.vtt
-*.srt
-
-# Sensitive Data & Cookies
-cookies.txt
+# Environment files
 .env
-*.pem
-*.key
+.env.local
+*.env.*
 
-# Demucs / AI Model Cache & Demux Outputs
-htdemucs/
-.cache/
-models/
-weights/
+# Logs
+*.log
 
-# IDEs & System Files
+# Editor/IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-.DS_Store
-Thumbs.db
-desktop.ini
+*.tmp
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+```
