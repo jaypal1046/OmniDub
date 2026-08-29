@@ -33,7 +33,7 @@ from core.video_merger import merge_project_video
 def get_translated_subtitle_path(project_dir):
     """
     Checks for Translated/ or translated/ subfolders containing .vtt or .srt files.
-    Returns directory path if multiple files exist, or single file path, or None.
+    Returns directory path if valid timestamped subtitle entries exist, or None.
     """
     possible_dirs = [
         os.path.join(project_dir, "Translated"),
@@ -43,7 +43,12 @@ def get_translated_subtitle_path(project_dir):
         if os.path.exists(t_dir) and os.path.isdir(t_dir):
             files = [f for f in os.listdir(t_dir) if f.endswith(".vtt") or f.endswith(".srt")]
             if files:
-                return t_dir
+                from core.tts_engine import parse_subtitle_file
+                entries = parse_subtitle_file(t_dir)
+                if entries:
+                    return t_dir
+                else:
+                    print(f"⚠️ Warning: Subtitle directory '{t_dir}' exists but contains no valid timestamped subtitle cues. Falling back to original transcript.")
     return None
 
 def process_recap_project(source_input, project_name=None, voice="en-US-GuyNeural", 

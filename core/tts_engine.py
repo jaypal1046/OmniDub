@@ -153,8 +153,7 @@ async def process_synced_redub_direct_async(subtitle_path, output_mp3, voice="en
     """
     entries = parse_subtitle_file(subtitle_path)
     if not entries:
-        print("Warning: No subtitle entries found to generate TTS.")
-        return output_mp3
+        raise ValueError(f"No valid timestamped subtitle entries found in subtitle source: '{subtitle_path}'. Cannot generate TTS voiceover.")
 
     project_dir = os.path.dirname(os.path.abspath(output_mp3))
     ref_audio = os.path.join(project_dir, "audio.mp3")
