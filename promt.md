@@ -24,4 +24,8 @@ DUBBING RULES:
 * Remove unnecessary filler and repetition when needed for timing.
 * Do not change the character's intent or meaning.
 
+4. OUTPUT FORMAT
+
+* Don't Change output format
+
 

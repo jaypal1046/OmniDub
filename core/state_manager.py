@@ -76,8 +76,15 @@ class StateManager:
             try:
                 with open(self.state_file, "r", encoding="utf-8") as f:
                     state = json.load(f)
-                    print(f"📋 Loaded existing project state from: {self.state_file}")
-                    return state
+                    stored_source = state.get("source")
+                    if stored_source and stored_source != self.source:
+                        print(f"🔄 Source URL change detected for project directory '{self.project_dir}':")
+                        print(f"   Previous: {stored_source}")
+                        print(f"   New:      {self.source}")
+                        print("⚠️ Re-initializing state to ensure fresh processing for the new video URL...")
+                    else:
+                        print(f"📋 Loaded existing project state from: {self.state_file}")
+                        return state
             except Exception as e:
                 print(f"Warning: Failed to load state file ({e}). Re-initializing state.")
 

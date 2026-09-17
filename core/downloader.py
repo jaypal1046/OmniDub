@@ -81,8 +81,8 @@ def download_media(source_url_or_path, project_dir):
             "--retry-sleep", "3"
         ]
 
-        # Use aria2c multi-connection engine if available for maximum speed & stability
-        if shutil.which("aria2c"):
+        # Use aria2c multi-connection engine if available for maximum speed & stability (except Bilibili which rate-limits multi-chunk aria2c)
+        if ("bilibili.com" not in source_url_or_path and "b23.tv" not in source_url_or_path) and shutil.which("aria2c"):
             print("🚀 Accelerating download using aria2c multi-connection engine...")
             js_solver_args += [
                 "--downloader", "aria2c",
@@ -97,7 +97,7 @@ def download_media(source_url_or_path, project_dir):
         # Check for specialized BBDown tool for Bilibili URLs
         if ("bilibili.com" in source_url_or_path or "b23.tv" in source_url_or_path) and shutil.which("BBDown"):
             print("⚡ Using specialized BBDown engine for Bilibili video...")
-            bb_cmd = ["BBDown", source_url_or_path, "--work-dir", project_dir, "-fn", "video"]
+            bb_cmd = ["BBDown", source_url_or_path, "--work-dir", project_dir, "-F", "video"]
             if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 100:
                 bb_cmd += ["-c", os.path.abspath("cookies.txt")]
             try:

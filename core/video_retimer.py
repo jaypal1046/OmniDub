@@ -327,9 +327,9 @@ def process_audio_driven_retiming(video_path, sub_path, project_dir, voice="en-U
 
         if use_bgm:
             filter_complex.append(f"[1:a]volume=1.0[v];[2:a]volume={bgm_volume}[b];[v][b]amix=inputs=2:duration=first[aout]")
-            cmd_final.extend(["-filter_complex", "".join(filter_complex), "-map", "0:v", "-map", "[aout]"])
+            cmd_final.extend(["-filter_complex", "".join(filter_complex), "-map", "0:v:0", "-map", "[aout]"])
         else:
-            cmd_final.extend(["-map", "0:v", "-map", "1:a"])
+            cmd_final.extend(["-map", "0:v:0", "-map", "1:a"])
 
         cmd_final.extend([
             "-c:v", "libx264", "-preset", "fast", "-crf", "24",
