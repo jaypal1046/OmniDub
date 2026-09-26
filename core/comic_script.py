@@ -64,6 +64,97 @@ MODEL_CANDIDATES = [
     "gemini-3.1-flash-lite"
 ]
 
+_SELECTED_VISION_PROVIDER = None
+
+def get_active_vision_provider() -> str:
+    """
+    Auto-detects active vision provider:
+    - Pings Ox Alpha. If 200 -> 'ox_alpha'
+    - Else if GEMINI_API_KEY is present -> 'gemini'
+    - Else if OPENROUTER_API_KEY is present -> 'openrouter'
+    - Else -> 'heuristic'
+    """
+    global _SELECTED_VISION_PROVIDER
+    if _SELECTED_VISION_PROVIDER is not None:
+        return _SELECTED_VISION_PROVIDER
+
+    ox_key = os.environ.get("ALPHA_OX_API_KEY") or os.environ.get("OX_ALPHA_API_KEY", "")
+    if ox_key:
+        try:
+            r = requests.post(
+                "https://oxalpha.run/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {ox_key}", "Content-Type": "application/json"},
+                json={"model": "ox-alpha", "messages": [{"role": "user", "content": "ping"}]},
+                timeout=3
+            )
+            if r.status_code == 200:
+                print("⚡ [Vision Engine] Ox Alpha is ONLINE (3M daily token quota active). Using Ox Alpha.")
+                _SELECTED_VISION_PROVIDER = "ox_alpha"
+                return _SELECTED_VISION_PROVIDER
+            else:
+                print(f"ℹ️ [Vision Engine] Ox Alpha is currently unavailable (HTTP {r.status_code}). Switching primary vision to Gemini Vision API.")
+        except Exception:
+            print("ℹ️ [Vision Engine] Ox Alpha is unreachable. Switching primary vision to Gemini Vision API.")
+
+    if os.environ.get("GEMINI_API_KEY"):
+        print("🤖 [Vision Engine] Active Provider: Google Gemini Vision API (GEMINI_API_KEY).")
+        _SELECTED_VISION_PROVIDER = "gemini"
+    elif os.environ.get("OPENROUTER_API_KEY"):
+        print("🌐 [Vision Engine] Active Provider: OpenRouter Vision API (OPENROUTER_API_KEY).")
+        _SELECTED_VISION_PROVIDER = "openrouter"
+    else:
+        print("💡 [Vision Engine] Active Provider: Storyteller Heuristic Engine.")
+        _SELECTED_VISION_PROVIDER = "heuristic"
+
+    return _SELECTED_VISION_PROVIDER
+
+
+def call_ox_alpha_vision(
+    system_instruction: str,
+    mime_type: str,
+    base64_data: str,
+    ox_key: Optional[str] = None,
+    base_url: str = "https://oxalpha.run/api/v1",
+    model: str = "ox-alpha"
+) -> Optional[dict]:
+    """Direct vision & story analysis call using Ox Alpha API (3M daily free tokens)."""
+    if not ox_key:
+        ox_key = os.environ.get("ALPHA_OX_API_KEY") or os.environ.get("OX_ALPHA_API_KEY", "")
+    if not ox_key:
+        return None
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {ox_key}",
+        "Content-Type": "application/json"
+    }
+    data_url = f"data:{mime_type};base64,{base64_data}"
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": system_instruction},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
+            }
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=25)
+        if res.status_code == 200:
+            res_json = res.json()
+            content = res_json['choices'][0]['message']['content']
+            parsed = clean_json_response(content)
+            if parsed and parsed.get("narrator_text"):
+                return parsed
+    except Exception:
+        pass
+    return None
+
+
 def call_openrouter_vision(system_instruction: str, mime_type: str, base64_data: str, openrouter_key: Optional[str] = None) -> Optional[dict]:
     """Vision call using OpenRouter API."""
     if not openrouter_key:
@@ -102,6 +193,51 @@ def call_openrouter_vision(system_instruction: str, mime_type: str, base64_data:
     return None
 
 
+def call_gemini_vision(system_instruction: str, mime_type: str, base64_data: str, api_key: Optional[str] = None) -> Optional[dict]:
+    """Direct Google Gemini Vision call."""
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    headers = {'Content-Type': 'application/json'}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": system_instruction},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_data
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.7,
+            "response_mime_type": "application/json"
+        }
+    }
+
+    for model in MODEL_CANDIDATES:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    parsed = clean_json_response(text_resp)
+                    if parsed and parsed.get("narrator_text"):
+                        return parsed
+        except Exception:
+            pass
+    return None
+
+
 def generate_script_for_page(
     image_path: str,
     page_num: int,
@@ -119,6 +255,7 @@ def generate_script_for_page(
     if not api_key:
         api_key = os.environ.get("GEMINI_API_KEY")
 
+    ox_key = os.environ.get("ALPHA_OX_API_KEY") or os.environ.get("OX_ALPHA_API_KEY", "")
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
 
     mime_type = get_mime_type(image_path)
@@ -160,59 +297,27 @@ def generate_script_for_page(
     if custom_prompt:
         system_instruction += f"\nCustom Creator Direction: {custom_prompt}"
 
+    provider = get_active_vision_provider()
 
-    # 1. Try OpenRouter Vision if key present
-    if openrouter_key:
+    # 1. Try Ox Alpha Vision
+    if provider == "ox_alpha":
+        ox_res = call_ox_alpha_vision(system_instruction, mime_type, base64_data, ox_key=ox_key)
+        if ox_res and ox_res.get("narrator_text"):
+            return ox_res
+
+    # 2. Try Gemini Vision (active primary fallback)
+    if provider == "gemini" or api_key:
+        gemini_res = call_gemini_vision(system_instruction, mime_type, base64_data, api_key=api_key)
+        if gemini_res and gemini_res.get("narrator_text"):
+            return gemini_res
+
+    # 3. Try OpenRouter Vision
+    if provider == "openrouter" or openrouter_key:
         openrouter_res = call_openrouter_vision(system_instruction, mime_type, base64_data, openrouter_key=openrouter_key)
         if openrouter_res and openrouter_res.get("narrator_text"):
-            narrator_text = openrouter_res.get("narrator_text", "").strip()
-            print(f"  🌐 AI Vision Script [Panel {page_num}/{total_pages}]: \"{narrator_text}\"", flush=True)
             return openrouter_res
 
-    # 2. Try Gemini Vision candidates
-    if api_key:
-        headers = {'Content-Type': 'application/json'}
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": system_instruction},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": base64_data
-                            }
-                        }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.7,
-                "response_mime_type": "application/json"
-            }
-        }
-
-        for model in MODEL_CANDIDATES:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            try:
-                res = requests.post(url, headers=headers, json=payload, timeout=12)
-                if res.status_code == 200:
-                    data = res.json()
-                    candidates = data.get("candidates", [])
-                    if candidates:
-                        text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                        parsed = clean_json_response(text_resp)
-                        if parsed and parsed.get("narrator_text"):
-                            narrator_text = parsed.get("narrator_text", "").strip()
-                            summary = parsed.get("page_summary", "").strip()
-                            print(f"  🤖 Gemini Vision ({model}) Script [Panel {page_num}/{total_pages}]: \"{narrator_text}\"")
-                            return {"narrator_text": narrator_text, "page_summary": summary}
-                elif res.status_code in (429, 404):
-                    pass
-            except Exception:
-                pass
-
-    # 3. Dynamic Narrative Fallback if API keys unavailable
+    # 4. Dynamic Narrative Fallback if API keys unavailable
     if is_first:
         fallback_narrative = "In a world ruled by overwhelming power, everything was about to change for our forgotten protagonist."
     elif ocr_text:
@@ -224,3 +329,4 @@ def generate_script_for_page(
         "narrator_text": fallback_narrative,
         "page_summary": f"Panel {page_num} visual action."
     }
+
