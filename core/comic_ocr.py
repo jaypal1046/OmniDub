@@ -1,10 +1,28 @@
 import os
+import threading
+import re
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
 from PIL import Image
 from core.crop_validator import ProtectedRegion
 
 _EASYOCR_READER = None
+_EASYOCR_LOCK = threading.Lock()
+_SECONDARY_OCR = threading.local()
+
+
+def crosscheck_ocr(image_path: str, first_text: str) -> tuple[str, bool]:
+    """Compare EasyOCR with independent RapidOCR; leave the choice to review."""
+    from rapidocr_onnxruntime import RapidOCR
+
+    if not hasattr(_SECONDARY_OCR, "reader"):
+        _SECONDARY_OCR.reader = RapidOCR()
+    result, _ = _SECONDARY_OCR.reader(image_path)
+    second_text = " ".join(item[1] for item in result or [])
+    normalize = lambda value: " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    first, second = normalize(first_text), normalize(second_text)
+    return second_text, bool(first or second) and SequenceMatcher(None, first, second).ratio() < 0.82
 
 @dataclass
 class OCRResult:
@@ -27,7 +45,9 @@ def extract_ocr_with_regions(image_path: str) -> OCRResult:
     try:
         import easyocr
         if _EASYOCR_READER is None:
-            _EASYOCR_READER = easyocr.Reader(['en'], gpu=False)
+            with _EASYOCR_LOCK:
+                if _EASYOCR_READER is None:
+                    _EASYOCR_READER = easyocr.Reader(['en'], gpu=False)
         results = _EASYOCR_READER.readtext(image_path)
         # results format: [([[x1,y1], [x2,y1], [x2,y2], [x1,y2]], text, prob), ...]
         text_lines = []
@@ -65,8 +85,8 @@ def extract_ocr_with_regions(image_path: str) -> OCRResult:
             confidence=avg_conf,
             error=None,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        easy_error = str(e)
 
     # Fallback to PyTesseract with bounding box data
     try:
@@ -113,7 +133,7 @@ def extract_ocr_with_regions(image_path: str) -> OCRResult:
             text="",
             regions=[],
             confidence=0.0,
-            error=str(e),
+            error=f"EasyOCR: {easy_error}; Tesseract: {e}",
         )
 
 
@@ -122,4 +142,6 @@ def extract_ocr_text_from_panel(image_path: str) -> str:
     Backward-compatibility wrapper returning extracted string.
     """
     res = extract_ocr_with_regions(image_path)
+    if not res.completed:
+        raise RuntimeError(f"OCR failed for {image_path}: {res.error}")
     return res.text

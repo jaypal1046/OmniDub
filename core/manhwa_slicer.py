@@ -84,29 +84,6 @@ def detect_true_gutters(gray_img: np.ndarray, min_gap_height: int = 35) -> List[
     return gutters
 
 
-def clip_bottom_banner(gray_img: np.ndarray, height_threshold: float = 0.94) -> int:
-    """
-    Scans bottom (y > 94% height) for website comment sections or ad footers.
-    Returns effective height after clipping.
-    """
-    h_img, w_img = gray_img.shape
-    scan_start = int(h_img * height_threshold)
-    if scan_start >= h_img - 40:
-        return h_img
-
-    sobelx = cv2.Sobel(gray_img[scan_start:, :], cv2.CV_64F, 1, 0, ksize=3)
-    sobely = cv2.Sobel(gray_img[scan_start:, :], cv2.CV_64F, 0, 1, ksize=3)
-    edge_density = np.sum(np.abs(sobelx) + np.abs(sobely), axis=1) / float(max(1, w_img))
-
-    for relative_y, ed in enumerate(edge_density):
-        if ed > 50.0:
-            abs_y = scan_start + relative_y
-            if abs_y < h_img - 80:
-                print(f"✂️ Clipped website comment banner at bottom (y={abs_y}px to {h_img}px).")
-                return abs_y
-    return h_img
-
-
 def draw_debug_preview(
     image_np: np.ndarray,
     candidate_boxes: List[Box],
@@ -218,10 +195,9 @@ def slice_strip(
                 json.dump([meta], f, indent=2)
         return [img_np], [meta]
 
-    # 1. Clip Bottom Website Comment/Footer Banner
-    effective_height = clip_bottom_banner(gray)
-    cropped_img_np = img_np[:effective_height, :, :]
-    gray_cropped = gray[:effective_height, :]
+    effective_height = gray.shape[0]
+    cropped_img_np = img_np
+    gray_cropped = gray
 
     # 2. Detect True Gutters
     gutters = detect_true_gutters(gray_cropped, min_gap_height=35)

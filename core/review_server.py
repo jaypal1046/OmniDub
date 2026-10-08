@@ -157,7 +157,7 @@ button {
 
 main {
   flex: 1;
-  padding: 2rem;
+  padding: 1rem;
   max-width: 1700px;
   margin: 0 auto;
   width: 100%;
@@ -167,7 +167,7 @@ main {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 1.5rem;
+  margin-bottom: 1rem;
   background: var(--surface);
   padding: 0.85rem 1.25rem;
   border-radius: 0.75rem;
@@ -194,11 +194,19 @@ main {
   border-color: var(--border);
 }
 
+.pager { display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin: 0.75rem 0; color: var(--text-muted); font-size: 0.85rem; }
+.pager button { padding: 0.45rem 0.75rem; background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+.pager button:disabled { opacity: 0.45; cursor: default; }
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 1.5rem;
+  gap: 1rem;
 }
+
+.grid.ocr-mode { grid-template-columns: repeat(auto-fill, minmax(min(100%, 600px), 1fr)); }
+.grid.ocr-mode .card { display: grid; grid-template-columns: minmax(0, 40%) minmax(0, 60%); }
+.grid.ocr-mode .card-img-wrap { height: 300px; }
 
 .card {
   background: var(--surface);
@@ -217,7 +225,7 @@ main {
 
 .card-img-wrap {
   width: 100%;
-  height: 380px;
+  height: 190px;
   background: #000;
   display: flex;
   align-items: center;
@@ -225,6 +233,8 @@ main {
   overflow: hidden;
   position: relative;
 }
+
+.card-img-wrap a { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
 
 .card-img-wrap img {
   max-width: 100%;
@@ -265,10 +275,10 @@ main {
 }
 
 .card-content {
-  padding: 1rem;
+  padding: 0.75rem;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.5rem;
   flex: 1;
 }
 
@@ -302,11 +312,27 @@ main {
   border: 1px solid rgba(255, 255, 255, 0.05);
 }
 
+.ocr-editor { display: grid; gap: 0.4rem; font-size: 0.75rem; color: var(--text-muted); }
+.ocr-editor textarea { width: 100%; min-height: 3.5rem; max-height: 7rem; resize: vertical; padding: 0.55rem; border-radius: 0.4rem; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
+.ocr-editor textarea:focus-visible, .ocr-editor button:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ocr-choices { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.ocr-choices button { padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 0.4rem; background: var(--bg); color: var(--text); cursor: pointer; }
+.ocr-warning { color: var(--warning); font-weight: 600; }
+.ocr-secondary summary { cursor: pointer; color: #a5b4fc; }
+.ocr-secondary div { margin-top: 0.35rem; max-height: 4rem; overflow: auto; overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  header, .controls-bar, .logo-group, .stat-pills, .header-actions, .filter-group { flex-wrap: wrap; }
+  header, main { padding: 0.75rem; }
+  .grid.ocr-mode .card { display: flex; }
+  .grid.ocr-mode .card-img-wrap { height: 230px; }
+}
+
 .action-selector {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   gap: 0.4rem;
-  margin-top: auto;
+  margin-top: 0.25rem;
 }
 
 .action-opt {
@@ -369,13 +395,14 @@ main {
       <div class="stat-pill include">🎬 <span id="count-include">0</span> Video</div>
       <div class="stat-pill story">📖 <span id="count-story">0</span> Story Only</div>
       <div class="stat-pill exclude">❌ <span id="count-exclude">0</span> Skipped</div>
+      <div class="stat-pill story">🔤 <span id="count-ocr">0</span> OCR checks</div>
     </div>
   </div>
 
   <div class="header-actions">
     <button class="btn-secondary" onclick="bulkExcludeBlanks()">⚡ Auto-Clean Ads & Blanks</button>
     <button class="btn-danger" onclick="cancelWorkflow()">✖ Cancel / Exit</button>
-    <button class="btn-primary" onclick="submitManifest()">🚀 Approve & Start Rendering</button>
+    <button class="btn-primary" onclick="submitManifest()">Save choices & continue</button>
   </div>
 </header>
 
@@ -383,16 +410,20 @@ main {
   <div class="controls-bar">
     <div class="filter-group">
       <button class="filter-btn active" onclick="filterCards('ALL', this)">All (<span id="total-count">0</span>)</button>
+      <button class="filter-btn" onclick="filterCards('NARRATED', this)">🎙️ Narrated scenes</button>
       <button class="filter-btn" onclick="filterCards('INCLUDE', this)">🎬 Video Only</button>
       <button class="filter-btn" onclick="filterCards('STORY_ONLY', this)">📖 Story Context Only</button>
       <button class="filter-btn" onclick="filterCards('EXCLUDE', this)">❌ Excluded</button>
+      <button class="filter-btn" onclick="filterCards('OCR_REVIEW', this)">🔤 OCR needs review</button>
     </div>
     <div style="font-size: 0.8rem; color: var(--text-muted);">
       💡 Click on any button below a panel to toggle between Video, Story Only, or Exclude.
     </div>
   </div>
 
+  <div class="pager"><button type="button" onclick="changePage(-1)">← Previous</button><span class="page-label"></span><button type="button" onclick="changePage(1)">Next →</button></div>
   <div class="grid" id="panel-grid"></div>
+  <div class="pager"><button type="button" onclick="changePage(-1)">← Previous</button><span class="page-label"></span><button type="button" onclick="changePage(1)">Next →</button></div>
 </main>
 
 <div class="toast" id="toast"></div>
@@ -400,6 +431,36 @@ main {
 <script>
 let panelsData = [];
 let currentFilter = 'ALL';
+let currentPage = 0;
+const pageSize = Math.max(1, Math.floor((Math.min(window.innerWidth, 1700) - 16) / 336));
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+
+function matchesFilter(panel, filter) {
+  return filter === 'ALL' || (filter === 'NARRATED' ? !!panel.narration : filter === 'OCR_REVIEW' ? !!panel.ocr_flagged && panel.action !== 'EXCLUDE' : panel.action === filter);
+}
+
+function filteredIndexes() {
+  return panelsData.map((panel, index) => matchesFilter(panel, currentFilter) ? index : -1).filter(index => index >= 0);
+}
+
+function changePage(direction) {
+  currentPage += direction;
+  renderGrid();
+  window.scrollTo({top: 0});
+}
+
+function updatePager(count) {
+  const pages = Math.ceil(count / pageSize);
+  document.querySelectorAll('.pager').forEach(pager => {
+    pager.querySelector('.page-label').textContent = `Page ${pages ? currentPage + 1 : 0} of ${pages} · ${count} panels`;
+    const buttons = pager.querySelectorAll('button');
+    buttons[0].disabled = currentPage === 0;
+    buttons[1].disabled = currentPage >= pages - 1;
+  });
+}
 
 async function init() {
   const res = await fetch('/api/panels');
@@ -416,93 +477,114 @@ function updateStats() {
   document.getElementById('count-include').innerText = inc;
   document.getElementById('count-story').innerText = story;
   document.getElementById('count-exclude').innerText = exc;
+  document.getElementById('count-ocr').innerText = panelsData.filter(p => p.ocr_flagged && p.action !== 'EXCLUDE').length;
   document.getElementById('total-count').innerText = panelsData.length;
 }
 
 function setAction(panelIndex, action) {
   panelsData[panelIndex].action = action;
-  const card = document.getElementById('card-' + panelIndex);
-  card.className = `card action-${action}`;
-  
-  const buttons = card.querySelectorAll('.action-opt');
-  buttons.forEach(btn => {
-    btn.className = 'action-opt';
-    if (btn.dataset.action === action) {
-      btn.classList.add(`active-${action}`);
-    }
-  });
-
+  renderGrid();
   updateStats();
-  if (currentFilter !== 'ALL' && currentFilter !== action) {
-    card.style.display = 'none';
-  }
+}
+
+function setOcr(panelIndex, choice) {
+  const panel = panelsData[panelIndex];
+  if (choice === 'second') panel.ocr_text = panel.ocr_secondary;
+  if (choice === 'first') panel.ocr_text = panel.ocr_first;
+  panel.ocr_ignore = choice === 'image_only';
+  panel.ocr_flagged = choice === 'flag';
+  panel.ocr_source = choice;
+  document.getElementById('ocr-text-' + panelIndex).value = panel.ocr_text;
+  document.getElementById('ocr-text-' + panelIndex).disabled = panel.ocr_ignore;
+  document.getElementById('ocr-status-' + panelIndex).textContent = panel.ocr_ignore ? 'Image only · OCR ignored' : panel.ocr_flagged ? 'Needs image check' : 'Text confirmed';
+  updateStats();
+}
+
+function editOcr(panelIndex, value) {
+  panelsData[panelIndex].ocr_text = value;
+  panelsData[panelIndex].ocr_ignore = false;
+  panelsData[panelIndex].ocr_flagged = false;
+  panelsData[panelIndex].ocr_source = 'manual';
+  document.getElementById('ocr-status-' + panelIndex).textContent = 'Text edited';
+  updateStats();
 }
 
 function filterCards(filter, btnEl) {
   currentFilter = filter;
+  currentPage = 0;
+  document.getElementById('panel-grid').classList.toggle('ocr-mode', filter === 'OCR_REVIEW');
   document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
   if (btnEl) {
     btnEl.classList.add('active');
   }
 
-  panelsData.forEach((p, idx) => {
-    const card = document.getElementById('card-' + idx);
-    if (!card) return;
-    if (filter === 'ALL' || p.action === filter) {
-      card.style.display = 'flex';
-    } else {
-      card.style.display = 'none';
-    }
-  });
+  renderGrid();
 }
 
 function bulkExcludeBlanks() {
-  panelsData.forEach((p, idx) => {
-    if (p.is_blank || p.is_ad) {
-      setAction(idx, 'EXCLUDE');
-    }
-  });
+  panelsData.forEach(p => { if (p.is_blank || p.is_ad) p.action = 'EXCLUDE'; });
+  renderGrid();
+  updateStats();
   showToast('⚡ Excluded all detected blanks & scanlation credits!');
 }
 
 function renderGrid() {
   const grid = document.getElementById('panel-grid');
   grid.innerHTML = '';
+  const indexes = filteredIndexes();
+  currentPage = Math.max(0, Math.min(currentPage, Math.ceil(indexes.length / pageSize) - 1));
+  if (!indexes.length) grid.textContent = 'No panels in this view.';
 
-  panelsData.forEach((p, idx) => {
+  indexes.slice(currentPage * pageSize, (currentPage + 1) * pageSize).forEach(idx => {
+    const p = panelsData[idx];
     const card = document.createElement('div');
     card.id = `card-${idx}`;
     card.className = `card action-${p.action}`;
 
     card.innerHTML = `
       <div class="card-img-wrap">
-        <span class="badge-mode">${p.framing_mode}</span>
+        <span class="badge-mode">${escapeHtml(p.framing_mode)}</span>
         <span class="badge-index">#${idx+1}</span>
-        <img src="/image/${encodeURIComponent(p.file)}" loading="lazy" alt="${p.file}" onerror="this.onerror=null;this.alt='Image preview unavailable'">
+        <a href="/image/${encodeURIComponent(p.file)}" target="_blank" rel="noopener" aria-label="Open full panel ${escapeHtml(p.file)}">
+          <img src="/image/${encodeURIComponent(p.file)}" loading="lazy" alt="${escapeHtml(p.file)}" onerror="this.onerror=null;this.alt='Image preview unavailable'">
+        </a>
       </div>
       <div class="card-content">
         <div class="card-header">
-          <span class="card-filename">${p.file}</span>
-          <span style="font-size:0.75rem;color:#64748b;">${p.height}px</span>
+          <span class="card-filename">${escapeHtml(p.file)}</span>
+          <span style="font-size:0.75rem;color:#64748b;">${escapeHtml(p.height)}px</span>
         </div>
-        <div class="card-reason">💡 ${p.reason}</div>
-        <div class="dialogue-box">${p.ocr_text || '(No dialogue text)'}</div>
+        <div class="card-reason">💡 ${escapeHtml(p.reason)}</div>
+        ${p.narration ? `<div class="dialogue-box">🎙️ ${escapeHtml(p.narration)}</div>` : ''}
         <div class="action-selector">
           <button class="action-opt ${p.action === 'INCLUDE' ? 'active-INCLUDE' : ''}" data-action="INCLUDE" onclick="setAction(${idx}, 'INCLUDE')">🎬 Video</button>
           <button class="action-opt ${p.action === 'STORY_ONLY' ? 'active-STORY_ONLY' : ''}" data-action="STORY_ONLY" onclick="setAction(${idx}, 'STORY_ONLY')">📖 Story</button>
           <button class="action-opt ${p.action === 'EXCLUDE' ? 'active-EXCLUDE' : ''}" data-action="EXCLUDE" onclick="setAction(${idx}, 'EXCLUDE')">❌ Skip</button>
         </div>
+        <div class="ocr-editor">
+          <label for="ocr-text-${idx}">Dialogue text · ${escapeHtml(p.file)}</label>
+          <textarea id="ocr-text-${idx}" maxlength="3000" oninput="editOcr(${idx}, this.value)" ${p.ocr_ignore ? 'disabled' : ''}>${escapeHtml(p.ocr_text || '')}</textarea>
+          ${p.ocr_secondary !== undefined ? `<details class="ocr-secondary" ${p.ocr_flagged ? 'open' : ''}><summary>Second OCR</summary><div>${escapeHtml(p.ocr_secondary || '(no text found)')}</div></details>` : ''}
+          <div id="ocr-status-${idx}" class="${p.ocr_flagged ? 'ocr-warning' : ''}">${p.ocr_ignore ? 'Image only · OCR ignored' : p.ocr_flagged ? 'Needs OCR review' : 'OCR ready'}</div>
+          <div class="ocr-choices">
+            <button type="button" onclick="setOcr(${idx}, 'first')">Keep first</button>
+            ${p.ocr_secondary ? `<button type="button" onclick="setOcr(${idx}, 'second')">Use second</button>` : ''}
+            <button type="button" onclick="setOcr(${idx}, 'flag')">Flag for image check</button>
+            <button type="button" onclick="setOcr(${idx}, 'image_only')">Image only · ignore OCR</button>
+          </div>
+        </div>
       </div>
     `;
     grid.appendChild(card);
   });
+  updatePager(indexes.length);
 }
 
 async function submitManifest() {
   const btn = document.querySelector('.btn-primary');
   if (btn) {
     btn.disabled = true;
-    btn.innerText = '⏳ Starting Engine...';
+    btn.innerText = '⏳ Saving choices...';
   }
 
   try {
@@ -514,17 +596,19 @@ async function submitManifest() {
     if (res.ok) {
       document.body.innerHTML = `
         <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;text-align:center;background:#0b0f19;">
-          <h1 style="font-size:2rem;color:#10b981;margin-bottom:1rem;">🎉 Manifest Approved!</h1>
-          <p style="color:#94a3b8;font-size:1.1rem;margin-bottom:1.5rem;">The AI recap engine has started video rendering in your terminal. You can close this tab now.</p>
+          <h1 style="font-size:2rem;color:#10b981;margin-bottom:1rem;">Choices saved</h1>
+          <p style="color:#94a3b8;font-size:1.1rem;margin-bottom:1.5rem;">Your panel choices are saved. You can close this tab now.</p>
           <button class="btn-primary" onclick="window.close()">Close Window</button>
         </div>
       `;
+    } else {
+      throw new Error('Review choices were rejected');
     }
   } catch (err) {
     alert('Error submitting manifest: ' + err);
     if (btn) {
       btn.disabled = false;
-      btn.innerText = '🚀 Approve & Start Rendering';
+      btn.innerText = 'Save choices & continue';
     }
   }
 }
@@ -628,17 +712,39 @@ class ReviewServerHandler(BaseHTTPRequestHandler):
 
         if path == "/api/submit":
             content_len = int(self.headers.get("Content-Length", 0))
+            if content_len <= 0 or content_len > 2_000_000:
+                self.send_error(413, "Review payload too large")
+                return
             body = self.rfile.read(content_len)
             try:
                 data = json.loads(body)
-                ReviewServerHandler.submitted_result = data
+                if not isinstance(data, list) or len(data) != len(self.panels_data):
+                    raise ValueError("Panel list changed")
+                for submitted, original in zip(data, self.panels_data):
+                    if (not isinstance(submitted, dict) or submitted.get("file") != original["file"] or
+                            submitted.get("action") not in ("INCLUDE", "STORY_ONLY", "EXCLUDE") or
+                            not isinstance(submitted.get("ocr_text"), str) or len(submitted["ocr_text"]) > 3000 or
+                            type(submitted.get("ocr_flagged")) is not bool or
+                            type(submitted.get("ocr_ignore")) is not bool or
+                            submitted.get("ocr_source") not in ("first", "second", "manual", "flag", "image_only")):
+                        raise ValueError("Invalid panel choice")
+                ReviewServerHandler.submitted_result = [
+                    {**original, "action": submitted["action"], "ocr_text": submitted["ocr_text"],
+                     "ocr_flagged": submitted["ocr_flagged"], "ocr_ignore": submitted["ocr_ignore"],
+                     "ocr_source": submitted["ocr_source"]}
+                    for submitted, original in zip(data, self.panels_data)
+                ]
                 resp = b'{"status":"ok"}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(resp)))
                 self.end_headers()
                 self.wfile.write(resp)
-            finally:
+            except (ValueError, UnicodeDecodeError):
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
                 if ReviewServerHandler.exit_event:
                     ReviewServerHandler.exit_event.set()
         elif path == "/api/cancel":
@@ -671,6 +777,17 @@ def launch_panel_review_web_ui(
     port = find_free_port()
     exit_event = threading.Event()
 
+    manifest_path = os.path.join(data_dir, "panel_manifest.json")
+    existing = {}
+    if os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            existing = {item["file"]: item for item in json.load(f)}
+    script_path = os.path.join(data_dir, "script.json")
+    narration = {}
+    if os.path.exists(script_path):
+        with open(script_path, "r", encoding="utf-8") as f:
+            narration = {item["file"]: item["script"] for item in json.load(f)}
+
     # Prepare Auto-Classified Initial State
     panels_data: List[Dict[str, Any]] = []
     for idx, img_p in enumerate(panel_images):
@@ -681,16 +798,26 @@ def launch_panel_review_web_ui(
 
         # Run CV & OCR Auto-Classifier
         cls_result = classify_panel_content(img_p, ocr_text=ocr_text, height_px=h)
+        previous = existing.get(fname, {})
+        action = previous.get("action", cls_result.action)
+        if action not in ("INCLUDE", "STORY_ONLY", "EXCLUDE"):
+            raise ValueError(f"Invalid saved panel action for {fname}: {action}")
 
         panels_data.append({
-            "panel": idx + 1,
+            "panel": previous.get("panel", idx + 1),
             "file": fname,
             "image_path": img_p,
-            "action": cls_result.action,
-            "reason": cls_result.reason,
+            "action": action,
+            "reason": previous.get("reason", cls_result.reason),
             "is_blank": cls_result.is_blank,
             "is_ad": cls_result.is_ad,
-            "ocr_text": ocr_text,
+            "ocr_text": previous.get("ocr_text", ocr_text),
+            "ocr_first": ocr_results.get(fname, {}).get("ocr_first", ocr_text),
+            "ocr_secondary": ocr_results.get(fname, {}).get("ocr_secondary", ""),
+            "ocr_flagged": previous.get("ocr_flagged", ocr_results.get(fname, {}).get("ocr_flagged", False)),
+            "ocr_ignore": previous.get("ocr_ignore", ocr_results.get(fname, {}).get("ocr_ignore", False)),
+            "ocr_source": previous.get("ocr_source", "first"),
+            "narration": narration.get(fname, ""),
             "height": h,
             "framing_mode": meta.get("framing_mode", "contain")
         })
@@ -713,7 +840,7 @@ def launch_panel_review_web_ui(
     print("🌐 [VISUAL REVIEW] OPENING INTERACTIVE DASHBOARD IN YOUR BROWSER...")
     print(f"👉 Dashboard URL: {url}")
     print("=========================================================================")
-    print("💡 Review and classify panels in the web browser, then click 'Approve & Start Rendering'.")
+    print("💡 Review and classify panels in the web browser, then click 'Save choices & continue'.")
     print("   The server will automatically terminate once approved or cancelled.\n")
 
     webbrowser.open(url)

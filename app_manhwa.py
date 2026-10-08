@@ -17,6 +17,7 @@ import sys
 import json
 import shutil
 import argparse
+import hashlib
 import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,8 +27,8 @@ from core.state_manager import StateManager, extract_video_id
 from core.manhwa_downloader import download_webtoon_url
 from core.comic_pdf import load_comic_images
 from core.manhwa_slicer import process_manhwa_images
-from core.comic_ocr import extract_ocr_text_from_panel
-from core.comic_script import generate_script_for_page
+from core.comic_ocr import crosscheck_ocr, extract_ocr_text_from_panel
+from core.story_pipeline import STORY_MODEL, build_story_script, skill_fingerprint
 from core.comic_animator import (
     generate_page_tts,
     build_ken_burns_video_segment,
@@ -57,6 +58,7 @@ def process_manhwa_recap_project(
     aspect: str = "16:9",
     auto_approve: bool = False,
     re_review: bool = False,
+    series_name: str = None,
 ):
     """
     Main controller for the AI Manhwa Recap Production Pipeline.
@@ -68,6 +70,8 @@ def process_manhwa_recap_project(
 
     if not project_name:
         project_name = extract_video_id(source_input)
+    if series_name and not re.fullmatch(r"[\w-]+", series_name):
+        raise ValueError("Series name may contain only letters, numbers, underscores, and hyphens")
 
     project_dir = os.path.abspath(os.path.join("output", project_name))
     os.makedirs(project_dir, exist_ok=True)
@@ -227,6 +231,21 @@ def process_manhwa_recap_project(
         state_mgr.mark_step_completed("ocr", result_files=[ocr_json_path, ocr_txt_path])
         print(f"✅ OCR results exported to:\n  📄 {ocr_json_path}\n  📄 {ocr_txt_path}")
 
+    if enable_ocr and (not auto_approve or re_review):
+        missing = [img for img in panel_images if "ocr_secondary" not in ocr_results.get(os.path.basename(img), {})]
+        if missing:
+            print(f"🔎 Checking OCR with RapidOCR on {len(missing)} panels...", flush=True)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {executor.submit(crosscheck_ocr, img, ocr_results[os.path.basename(img)].get("ocr_text", "")): img
+                           for img in missing}
+                for future in as_completed(futures):
+                    img = futures[future]
+                    second, flagged = future.result()
+                    ocr_results[os.path.basename(img)].update(ocr_secondary=second, ocr_flagged=flagged)
+            with open(ocr_json_path, "w", encoding="utf-8") as out:
+                json.dump(ocr_results, out, indent=2, ensure_ascii=False)
+            print(f"🔎 OCR check flagged {sum(bool(item.get('ocr_flagged')) for item in ocr_results.values())} panels for review.")
+
     # -------------------------------------------------------------------------
     # STEP 3.5: AI/CV AUTO-CLASSIFIER + VISUAL 1-CLICK WEB REVIEW DASHBOARD
     # -------------------------------------------------------------------------
@@ -236,7 +255,8 @@ def process_manhwa_recap_project(
     from core.panel_classifier import classify_panel_content
     from core.review_server import launch_panel_review_web_ui
 
-    if not force and not re_review and state_mgr.is_step_completed("panel_review", [manifest_json_path]):
+    if not force and not re_review and state_mgr.is_step_completed(
+            "panel_review", [manifest_json_path], current_params={"ocr_review": 2}):
         print(f"⏩ [3.5/6] Step 'panel_review' already COMPLETED (cached in state.json). Skipping.")
         with open(manifest_json_path, "r", encoding="utf-8") as f:
             final_manifest = json.load(f)
@@ -244,7 +264,7 @@ def process_manhwa_recap_project(
         story_context_only = [p["image_path"] for p in final_manifest if p.get("action") == "STORY_ONLY"]
         exc_count = len(final_manifest) - len(active_panels) - len(story_context_only)
         print(f"📋 Loaded Approved Manifest: 🎬 {len(active_panels)} Video Panels | 📖 {len(story_context_only)} Story Context | ❌ {exc_count} Excluded")
-    elif auto_approve:
+    elif auto_approve and not re_review:
         # Automated classification without browser popup
         active_panels = []
         story_context_only = []
@@ -280,7 +300,8 @@ def process_manhwa_recap_project(
         with open(manifest_txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(txt_lines))
 
-        state_mgr.mark_step_completed("panel_review", result_files=[manifest_json_path, manifest_txt_path])
+        state_mgr.mark_step_completed("panel_review", result_files=[manifest_json_path, manifest_txt_path],
+                                      params={"ocr_review": 2})
         print(f"🤖 Auto-Classification Approved & Saved to State: 🎬 {len(active_panels)} Video Panels | 📖 {len(story_context_only)} Story Context | ❌ {len(panel_images) - len(active_panels) - len(story_context_only)} Excluded")
     else:
         active_panels, story_context_only = launch_panel_review_web_ui(
@@ -290,7 +311,8 @@ def process_manhwa_recap_project(
             slicer_meta_map=slicer_meta_map,
             data_dir=data_dir,
         )
-        state_mgr.mark_step_completed("panel_review", result_files=[manifest_json_path, manifest_txt_path])
+        state_mgr.mark_step_completed("panel_review", result_files=[manifest_json_path, manifest_txt_path],
+                                      params={"ocr_review": 2})
 
     panel_images = active_panels
     total_panels = len(panel_images)
@@ -301,9 +323,26 @@ def process_manhwa_recap_project(
     # -------------------------------------------------------------------------
     with open(manifest_json_path, "r", encoding="utf-8") as f:
         full_manifest_items = json.load(f)
+    for item in full_manifest_items:
+        result = ocr_results.get(item["file"])
+        if result is None:
+            continue
+        if "ocr_text" in item:
+            if item["ocr_text"] != result.get("ocr_text"):
+                result.setdefault("ocr_first", result.get("ocr_text", ""))
+            result["ocr_text"] = item["ocr_text"]
+        result["ocr_flagged"] = item.get("ocr_flagged", result.get("ocr_flagged", False))
+        result["ocr_ignore"] = item.get("ocr_ignore", result.get("ocr_ignore", False))
+        result["ocr_source"] = item.get("ocr_source", result.get("ocr_source", "first"))
+    with open(ocr_json_path, "w", encoding="utf-8") as out:
+        json.dump(ocr_results, out, indent=2, ensure_ascii=False)
+    with open(ocr_txt_path, "w", encoding="utf-8") as out:
+        out.write("\n".join(f"Scene [{item['file']}]: {'(Image only — OCR ignored)' if ocr_results[item['file']].get('ocr_ignore') else ocr_results[item['file']]['ocr_text'] or '(No Dialogue Text Detected)'}"
+                            for item in sorted(full_manifest_items, key=lambda item: item["panel"])))
 
     # Filter out excluded/blank slices and preserve full chronological story flow
-    story_flow_items = [item for item in full_manifest_items if item.get("action") in ("INCLUDE", "STORY_ONLY")]
+    story_flow_items = sorted((item for item in full_manifest_items if item.get("action") in ("INCLUDE", "STORY_ONLY")),
+                              key=lambda item: item["panel"])
     total_story_steps = len(story_flow_items)
     video_scenes_total = len([item for item in story_flow_items if item.get("action") == "INCLUDE"])
 
@@ -322,127 +361,54 @@ def process_manhwa_recap_project(
                 buf = f.read(65536)
         return hasher.hexdigest()
 
-    cache_json_path = os.path.join(data_dir, "panel_script_cache.json")
-    script_cache = {}
-
-    for cache_p in (script_json_path, cache_json_path):
-        if os.path.exists(cache_p):
-            try:
-                with open(cache_p, "r", encoding="utf-8") as f:
-                    cached_list = json.load(f)
-                    for c_item in cached_list:
-                        c_hash = c_item.get("md5", "")
-                        c_file = c_item.get("file", "")
-                        if c_item.get("script"):
-                            if c_hash:
-                                script_cache[c_hash] = c_item
-                            if c_file:
-                                script_cache[c_file] = c_item
-            except Exception:
-                pass
-
-    if state_mgr.is_step_completed("story_script") and os.path.exists(script_json_path):
-        print(f"⏩ [4/6] Step 'story_script' already COMPLETED (cached). Skipping.")
+    story_dir = os.path.abspath(os.path.join("output", series_name, "_story")) if series_name else project_dir
+    bible_path = os.path.join(story_dir, "data", "story_bible.json")
+    beats_path = os.path.join(data_dir, "story_beats.json")
+    plan_path = os.path.join(data_dir, "story_plan.json")
+    story_inputs = [(item["file"], item["action"], ocr_results.get(item["file"], {}).get("ocr_text", ""),
+                     ocr_results.get(item["file"], {}).get("ocr_ignore", False),
+                     ocr_results.get(item["file"], {}).get("ocr_flagged", False),
+                     os.stat(item["image_path"]).st_size, os.stat(item["image_path"]).st_mtime_ns)
+                    for item in story_flow_items]
+    story_params = {"pipeline": 4, "series": series_name, "model": STORY_MODEL, "skills": skill_fingerprint(),
+                    "inputs": hashlib.sha256(json.dumps(story_inputs).encode("utf-8")).hexdigest(),
+                    "prompt": hashlib.sha256((custom_prompt or "").encode("utf-8")).hexdigest()}
+    if state_mgr.is_step_completed("story_script", [script_json_path, bible_path, beats_path, plan_path], current_params=story_params):
+        print("Story script already complete; using saved script.")
         with open(script_json_path, "r", encoding="utf-8") as f:
             script_items = json.load(f)
     else:
-        # Pre-pass: Attach chronological preceding lore to each video scene
-        prepared_video_scenes = []
-        pending_lore_buffer = []
-        scene_counter = 0
-
-        for story_idx, item in enumerate(story_flow_items):
-            fname = item["file"]
-            img_path = item["image_path"]
-            action = item.get("action", "INCLUDE")
-            ocr_text = ocr_results.get(fname, {}).get("ocr_text", "").strip()
-
-            if action == "STORY_ONLY":
-                if ocr_text:
-                    pending_lore_buffer.append(f"[{fname} Lore]: {ocr_text}")
-                    print(f"  📖 [Story Flow {story_idx+1}/{total_story_steps}] Reading lore panel {fname}: \"{ocr_text[:60]}\"", flush=True)
-                else:
-                    print(f"  📖 [Story Flow {story_idx+1}/{total_story_steps}] Lore panel {fname} has no dialogue.", flush=True)
-            elif action == "INCLUDE":
-                scene_counter += 1
-                local_lore = "\n".join(pending_lore_buffer)
-                pending_lore_buffer = []  # consume buffer
-                prepared_video_scenes.append({
-                    "story_step": story_idx + 1,
-                    "scene_num": scene_counter,
-                    "file": fname,
-                    "image_path": img_path,
-                    "ocr_text": ocr_text,
-                    "preceding_lore": local_lore,
-                })
-
-        def process_scene_script(scene_info):
-            story_step = scene_info["story_step"]
-            scene_num = scene_info["scene_num"]
-            fname = scene_info["file"]
-            img_path = scene_info["image_path"]
-            panel_ocr = scene_info["ocr_text"]
-            preceding_lore = scene_info["preceding_lore"]
-            img_md5 = get_file_md5(img_path)
-            panel_meta = slicer_meta_map.get(fname, {})
-            framing_mode = panel_meta.get("framing_mode", "contain")
-            val_score = panel_meta.get("validation_score", 1.0)
-
-            # Check cache
-            cached = script_cache.get(img_md5) or script_cache.get(fname)
-            if cached and cached.get("script"):
-                print(f"⏩ [Story Flow {story_step}/{total_story_steps} | Scene {scene_num}/{video_scenes_total}] Reusing cached narration for {fname}.", flush=True)
-                return {
-                    "panel": scene_num,
-                    "file": fname,
-                    "image_path": img_path,
-                    "framing_mode": framing_mode,
-                    "validation_score": val_score,
-                    "md5": img_md5,
-                    "ocr_text": panel_ocr,
-                    "script": cached["script"],
-                    "summary": cached.get("summary", f"Scene {scene_num}.")
-                }
-
-            print(f"  ⚡ [Story Flow {story_step}/{total_story_steps} | Scene {scene_num}/{video_scenes_total}] Analyzing {fname} (Mode: {framing_mode})...", flush=True)
-            script_data = generate_script_for_page(
-                image_path=img_path,
-                page_num=scene_num,
-                total_pages=video_scenes_total,
-                ocr_text=panel_ocr,
-                custom_prompt=custom_prompt,
-                mode=mode,
-                chapter_context=preceding_lore
-            )
-
-            script_text = script_data.get("narrator_text", "")
-            return {
-                "panel": scene_num,
-                "file": fname,
-                "image_path": img_path,
-                "framing_mode": framing_mode,
-                "validation_score": val_score,
-                "md5": img_md5,
-                "ocr_text": panel_ocr,
-                "script": script_text,
-                "summary": script_data.get("page_summary", f"Scene {scene_num}.")
-            }
-
-        script_items_map = {}
-        with ThreadPoolExecutor(max_workers=min(workers, 8)) as executor:
-            futures = [executor.submit(process_scene_script, scene_info) for scene_info in prepared_video_scenes]
-            for future in as_completed(futures):
-                item = future.result()
-                script_items_map[item["panel"]] = item
-
-        script_items = [script_items_map[p_num] for p_num in sorted(script_items_map.keys())]
+        story_panels = [{**item, "ocr_text": "" if ocr_results.get(item["file"], {}).get("ocr_ignore") else ocr_results.get(item["file"], {}).get("ocr_text", ""),
+                         "ocr_ignore": ocr_results.get(item["file"], {}).get("ocr_ignore", False),
+                         "ocr_flagged": ocr_results.get(item["file"], {}).get("ocr_flagged", False)}
+                        for item in story_flow_items]
+        notes, narration = build_story_script(project_dir, project_name, story_panels, custom_prompt, story_dir)
+        with open(plan_path, encoding="utf-8") as f:
+            story_plan = json.load(f)
+        script_items = []
+        for story_index, (panel, note) in enumerate(zip(story_panels, notes), 1):
+            if panel.get("action") != "INCLUDE":
+                continue
+            filename = panel["file"]
+            meta = slicer_meta_map.get(filename, {})
+            script_items.append({
+                "panel": len(script_items) + 1,
+                "story_panel": story_index,
+                "file": filename,
+                "image_path": panel["image_path"],
+                "framing_mode": meta.get("framing_mode", "contain"),
+                "validation_score": meta.get("validation_score", 1.0),
+                "md5": get_file_md5(panel["image_path"]),
+                "ocr_text": panel["ocr_text"],
+                "script": narration[story_index],
+                "summary": note["beat"],
+                "target_sec": story_plan["panels"][story_index - 1]["target_sec"],
+            })
 
         # Save to data directory
         with open(script_json_path, "w", encoding="utf-8") as f:
             json.dump(script_items, f, indent=2, ensure_ascii=False)
 
-        with open(cache_json_path, "w", encoding="utf-8") as f:
-            json.dump(script_items, f, indent=2, ensure_ascii=False)
 
 
 
@@ -457,14 +423,16 @@ def process_manhwa_recap_project(
         with open(master_script_txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(master_paragraphs))
 
-        state_mgr.mark_step_completed("story_script", result_files=[script_json_path, master_script_txt_path])
+        state_mgr.mark_step_completed("story_script", result_files=[script_json_path, master_script_txt_path, bible_path, beats_path, plan_path], params=story_params)
         print(f"✅ Master Script generated:\n  📄 {script_json_path}\n  📄 {master_script_txt_path}")
+        print(f"⏱️ Estimated narration: {story_plan['estimated_total_sec'] / 60:.1f} minutes across {len(script_items)} video panels")
 
     # -------------------------------------------------------------------------
     # STEP 5 & 6: PARALLEL TTS AUDIO + VIDEO CLIP RENDERING
     # -------------------------------------------------------------------------
     print(f"\n🎙️🎬 [5/6 & 6/6] Steps 'video_render': Multi-Mode Video Clip Rendering ({workers} workers)...")
-    if state_mgr.is_step_completed("video_render", [final_video_path, master_audio_path], current_params={"aspect": aspect, "voice": voice}):
+    render_params = {"aspect": aspect, "voice": voice, "script": get_file_md5(script_json_path), "renderer": 2}
+    if state_mgr.is_step_completed("video_render", [final_video_path, master_audio_path], current_params=render_params):
         print(f"⏩ [5/6 & 6/6] Steps already COMPLETED (cached). Skipping.")
     else:
         def process_scene_clip(args):
@@ -473,7 +441,8 @@ def process_manhwa_recap_project(
             img_path = item["image_path"]
             narrator_text = item["script"]
             framing_mode = item.get("framing_mode", "contain")
-            segment_audio_path = os.path.join(audio_dir, f"audio_{panel_num:03d}.mp3")
+            audio_key = hashlib.sha256(f"{voice}\0{narrator_text}".encode("utf-8")).hexdigest()[:12]
+            segment_audio_path = os.path.join(audio_dir, f"audio_{panel_num:03d}_{audio_key}.mp3")
             segment_video_path = os.path.join(clips_dir, f"clip_{panel_num:03d}.mp4")
             anim_preset = PRESETS[idx % len(PRESETS)]
 
@@ -481,6 +450,9 @@ def process_manhwa_recap_project(
 
             # 1. Synthesize TTS
             generate_page_tts(narrator_text, segment_audio_path, voice=voice)
+            audio_duration = get_audio_duration_sec(segment_audio_path)
+            if audio_duration > min(20, item["target_sec"] + 5):
+                raise ValueError(f"Panel {panel_num} audio is {audio_duration:.1f}s, over its {item['target_sec']}s story budget")
 
             # 2. Render Video Clip
             build_ken_burns_video_segment(
@@ -517,6 +489,14 @@ def process_manhwa_recap_project(
                 combined_audio += clip
 
         combined_audio.export(master_audio_path, format="mp3", bitrate="192k")
+        with open(plan_path, encoding="utf-8") as f:
+            story_plan = json.load(f)
+        for item in script_items:
+            story_plan["panels"][item["story_panel"] - 1]["actual_sec"] = round(get_audio_duration_sec(audio_clips_map[item["panel"]]), 2)
+        story_plan["actual_total_sec"] = round(sum(panel.get("actual_sec", 0) for panel in story_plan["panels"]), 2)
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(story_plan, f, indent=2, ensure_ascii=False)
+        print(f"⏱️ Actual narration: {story_plan['actual_total_sec'] / 60:.1f} minutes")
 
         # Save Scene Map JSON (PDF Blueprint)
         scene_map = []
@@ -535,7 +515,7 @@ def process_manhwa_recap_project(
         print(f"\n🧩 Stitching {len(ordered_clips)} synchronized scene clips into FINAL MASTER VIDEO...")
         concatenate_video_segments(ordered_clips, final_video_path)
 
-        state_mgr.mark_step_completed("video_render", result_files=[final_video_path, master_audio_path], params={"aspect": aspect, "voice": voice})
+        state_mgr.mark_step_completed("video_render", result_files=[final_video_path, master_audio_path], params=render_params)
 
     state_mgr.set_project_status("COMPLETED")
     print("\n=========================================================================")
@@ -564,6 +544,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-run all steps bypassing state cache")
     parser.add_argument("--fps", type=int, help="Video FPS (default: 30)", default=30)
     parser.add_argument("--prompt", help="Custom prompt instructions for script writer", default=None)
+    parser.add_argument("--series", help="Share story bible across chapters under output/SERIES/_story", default=None)
 
     args = parser.parse_args()
 
@@ -585,6 +566,7 @@ def main():
             custom_prompt=args.prompt,
             auto_approve=args.auto_approve,
             re_review=args.re_review,
+            series_name=args.series,
         )
     except Exception as e:
         print(f"\n❌ Error executing Manhwa Recap engine: {e}")

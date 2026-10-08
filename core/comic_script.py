@@ -57,53 +57,21 @@ def clean_json_response(raw_text: str) -> Optional[dict]:
                 pass
     return None
 
-MODEL_CANDIDATES = [
-    "gemini-2.5-flash",
-    "gemini-3.6-flash",
-    "gemini-flash-latest",
-    "gemini-3.1-flash-lite"
-]
+MODEL_CANDIDATES = ["gemini-3.5-flash-lite"]
 
 _SELECTED_VISION_PROVIDER = None
 
 def get_active_vision_provider() -> str:
-    """
-    Auto-detects active vision provider:
-    - Pings Ox Alpha. If 200 -> 'ox_alpha'
-    - Else if GEMINI_API_KEY is present -> 'gemini'
-    - Else if OPENROUTER_API_KEY is present -> 'openrouter'
-    - Else -> 'heuristic'
-    """
+    """Use Gemini for vision when configured."""
     global _SELECTED_VISION_PROVIDER
     if _SELECTED_VISION_PROVIDER is not None:
         return _SELECTED_VISION_PROVIDER
 
-    ox_key = os.environ.get("ALPHA_OX_API_KEY") or os.environ.get("OX_ALPHA_API_KEY", "")
-    if ox_key:
-        try:
-            r = requests.post(
-                "https://oxalpha.run/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {ox_key}", "Content-Type": "application/json"},
-                json={"model": "ox-alpha", "messages": [{"role": "user", "content": "ping"}]},
-                timeout=3
-            )
-            if r.status_code == 200:
-                print("⚡ [Vision Engine] Ox Alpha is ONLINE (3M daily token quota active). Using Ox Alpha.")
-                _SELECTED_VISION_PROVIDER = "ox_alpha"
-                return _SELECTED_VISION_PROVIDER
-            else:
-                print(f"ℹ️ [Vision Engine] Ox Alpha is currently unavailable (HTTP {r.status_code}). Switching primary vision to Gemini Vision API.")
-        except Exception:
-            print("ℹ️ [Vision Engine] Ox Alpha is unreachable. Switching primary vision to Gemini Vision API.")
-
     if os.environ.get("GEMINI_API_KEY"):
         print("🤖 [Vision Engine] Active Provider: Google Gemini Vision API (GEMINI_API_KEY).")
         _SELECTED_VISION_PROVIDER = "gemini"
-    elif os.environ.get("OPENROUTER_API_KEY"):
-        print("🌐 [Vision Engine] Active Provider: OpenRouter Vision API (OPENROUTER_API_KEY).")
-        _SELECTED_VISION_PROVIDER = "openrouter"
     else:
-        print("💡 [Vision Engine] Active Provider: Storyteller Heuristic Engine.")
+        print("💡 [Vision Engine] Gemini key unavailable; using heuristic engine.")
         _SELECTED_VISION_PROVIDER = "heuristic"
 
     return _SELECTED_VISION_PROVIDER
@@ -255,9 +223,6 @@ def generate_script_for_page(
     if not api_key:
         api_key = os.environ.get("GEMINI_API_KEY")
 
-    ox_key = os.environ.get("ALPHA_OX_API_KEY") or os.environ.get("OX_ALPHA_API_KEY", "")
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-
     mime_type = get_mime_type(image_path)
     base64_data = encode_image_base64(image_path)
 
@@ -299,25 +264,13 @@ def generate_script_for_page(
 
     provider = get_active_vision_provider()
 
-    # 1. Try Ox Alpha Vision
-    if provider == "ox_alpha":
-        ox_res = call_ox_alpha_vision(system_instruction, mime_type, base64_data, ox_key=ox_key)
-        if ox_res and ox_res.get("narrator_text"):
-            return ox_res
-
-    # 2. Try Gemini Vision (active primary fallback)
+    # Try Gemini Vision
     if provider == "gemini" or api_key:
         gemini_res = call_gemini_vision(system_instruction, mime_type, base64_data, api_key=api_key)
         if gemini_res and gemini_res.get("narrator_text"):
             return gemini_res
 
-    # 3. Try OpenRouter Vision
-    if provider == "openrouter" or openrouter_key:
-        openrouter_res = call_openrouter_vision(system_instruction, mime_type, base64_data, openrouter_key=openrouter_key)
-        if openrouter_res and openrouter_res.get("narrator_text"):
-            return openrouter_res
-
-    # 4. Dynamic Narrative Fallback if API keys unavailable
+    # Dynamic Narrative Fallback if API keys unavailable
     if is_first:
         fallback_narrative = "In a world ruled by overwhelming power, everything was about to change for our forgotten protagonist."
     elif ocr_text:
@@ -329,4 +282,3 @@ def generate_script_for_page(
         "narrator_text": fallback_narrative,
         "page_summary": f"Panel {page_num} visual action."
     }
-

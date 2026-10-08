@@ -7,4 +7,5 @@ demucs>=4.0.0
 torch
 torchaudio
 requests
+rapidocr-onnxruntime==1.4.4
 aiohttp
