@@ -80,9 +80,9 @@ def _ask(prompt, images=(), role="story-analysis"):
                       "contents": [{"parts": parts}], "generationConfig": {"response_mime_type": "application/json"}},
                 timeout=(10, 120),
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if attempt == 2:
-                raise RuntimeError("Gemini request failed after 3 attempts") from None
+                raise RuntimeError(f"Gemini request failed after 3 attempts ({type(exc).__name__})") from exc
         else:
             if response.ok:
                 try:
@@ -160,6 +160,7 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
     notes = []
     chapter_so_far = ""
     summary_through = 0
+    narration_batches = []
     if os.path.exists(progress_path):
         with open(progress_path, encoding="utf-8") as source:
             progress = json.load(source)
@@ -171,6 +172,7 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             bible = progress["bible"]
             chapter_so_far = progress.get("chapter_so_far", "")
             summary_through = progress.get("summary_through", 0)
+            narration_batches = progress.get("narration_batches", [])
     crops_dir = os.path.join(story_dir, "data", "character_crops")
     os.makedirs(crops_dir, exist_ok=True)
     batch_facts = {}
@@ -298,6 +300,8 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             bible["timeline"].append({"chapter": chapter_id, "panel": position, "event": fact["timeline_event"]})
         _save_json(progress_path, {"signature": signature, "notes": notes, "bible": bible,
                                    "chapter_so_far": chapter_so_far, "summary_through": summary_through})
+        if position % ANALYSIS_BATCH_SIZE == 0 or position == len(panels):
+            print(f"📖 Story analysis: {position}/{len(panels)} panels", flush=True)
     _save_json(os.path.join(data_dir, "story_beats.json"), notes)
 
     plan = []
@@ -328,6 +332,9 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
     }
     by_panel = {}
     for start in range(0, len(notes), 12):
+        if start // 12 < len(narration_batches):
+            by_panel.update({line["panel"]: line["text"] for line in narration_batches[start // 12]})
+            continue
         batch = notes[start:start + 12]
         batch_plan = plan[start:start + 12]
         narration = _ask(
@@ -378,6 +385,12 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             if len(text.split()) > item["max_words"] or len(text) > item["max_chars"]:
                 raise RuntimeError(f"Panel {item['panel']} exceeds its narration time budget")
             by_panel[item["panel"]] = text
+        narration_batches.append([{"panel": item["panel"], "text": by_panel[item["panel"]]}
+                                  for item in batch_plan if item["target_sec"]])
+        _save_json(progress_path, {"signature": signature, "notes": notes, "bible": bible,
+                                   "chapter_so_far": chapter_so_far, "summary_through": summary_through,
+                                   "narration_batches": narration_batches})
+        print(f"🎙️ Narration: {min(start + 12, len(notes))}/{len(notes)} story panels", flush=True)
     for note in notes:
         if note["action"] == "INCLUDE" and not str(by_panel.get(note["panel"], "")).strip():
             raise RuntimeError(f"Narrator omitted panel {note['panel']}")

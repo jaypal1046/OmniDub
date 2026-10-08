@@ -68,6 +68,51 @@ class StoryPipelineTest(unittest.TestCase):
             self.assertEqual(_ask("facts"), {"beat": "ok"})
             self.assertEqual(post.call_count, 2)
 
+    def test_request_failure_reports_cause(self):
+        import requests
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test"}), patch(
+            "core.story_pipeline.requests.post", side_effect=requests.ReadTimeout("private details")
+        ), patch("core.story_pipeline.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "after 3 attempts \\(ReadTimeout\\)"):
+                _ask("facts")
+
+    def test_resume_reuses_completed_narration_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            panels = []
+            for number in range(13):
+                path = root / f"{number}.png"
+                Image.new("RGB", (10, 10), "red").save(path)
+                panels.append({"file": path.name, "image_path": str(path), "action": "INCLUDE", "ocr_text": ""})
+            narration_calls = []
+
+            def answer(prompt, images=(), role="story-analysis"):
+                if "factual manhwa story analyst" in prompt:
+                    first = int(Path(images[0][1]).stem) + 1
+                    return {"panels": [{"panel": number, "beat": "An event.", "characters": [],
+                                        "new_threads": [], "resolved_threads": [], "timeline_event": None}
+                                       for number in range(first, min(first + 6, 14))]}
+                if "recap storyteller" in prompt:
+                    narration_calls.append(prompt)
+                    if len(narration_calls) == 2:
+                        raise RuntimeError("temporary failure")
+                    first = 1 if "panels 1-12" in prompt else 13
+                    return {"lines": [{"panel": number, "text": "An event occurred."}
+                                      for number in range(first, min(first + 12, 14))]}
+                if "Summarize these factual" in prompt:
+                    return {"summary": "Events so far."}
+                return {"summary": ["Events occurred."], "rolling_summary": "Events occurred.", "relations": []}
+
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                with self.assertRaisesRegex(RuntimeError, "temporary failure"):
+                    build_story_script(str(root), "chapter", panels)
+                notes, lines = build_story_script(str(root), "chapter", panels)
+            self.assertEqual(len(notes), 13)
+            self.assertEqual(len(lines), 13)
+            self.assertEqual(len(narration_calls), 3)
+            self.assertFalse((root / "data" / "story_progress.json").exists())
+
     def test_invalid_model_json_retries(self):
         class Response:
             ok = True
