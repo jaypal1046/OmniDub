@@ -4,7 +4,9 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -95,7 +97,23 @@ def _ask(prompt, images=(), role="story-analysis"):
                     raise RuntimeError("Gemini returned invalid story JSON")
                 time.sleep(2 ** attempt)
                 continue
-            if response.status_code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+            if response.status_code == 429:
+                retry = getattr(response, "headers", {}).get("Retry-After", "")
+                if not retry:
+                    try:
+                        details = response.json().get("error", {}).get("details", [])
+                        retry = next((item.get("retryDelay", "") for item in details
+                                      if isinstance(item, dict) and item.get("retryDelay")), "")
+                    except (ValueError, AttributeError, TypeError):
+                        pass
+                delay = float(str(retry).rstrip("s")) if re.fullmatch(r"\d+(?:\.\d+)?s?", str(retry)) else 30 * 2 ** attempt
+                if attempt == 2 or delay > 120:
+                    raise RuntimeError(f"Gemini HTTP 429: rate limit or quota exhausted. "
+                                       f"Saved chapter progress; retry later (suggested wait {delay:.0f}s).")
+                print(f"⏳ Gemini rate limit; retrying in {delay:.0f}s...", flush=True)
+                time.sleep(max(1, delay))
+                continue
+            if response.status_code not in (408, 500, 502, 503, 504) or attempt == 2:
                 raise RuntimeError(f"Gemini HTTP {response.status_code}")
         time.sleep(2 ** attempt)
 
@@ -177,13 +195,13 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
     os.makedirs(crops_dir, exist_ok=True)
     batch_facts = {}
     for position, panel in enumerate(panels[len(notes):], len(notes) + 1):
-        if len(notes) >= 12 and len(notes) % 12 == 0 and summary_through < len(notes):
+        if len(notes) >= 24 and len(notes) % 24 == 0 and summary_through < len(notes):
             summary = _ask(
                 "Summarize these factual chapter beats into one short paragraph for following-panel analysis. "
                 "Preserve named characters, causality, unresolved threads, and uncertainty. Add no new facts. "
                 "Return JSON object {\"summary\":\"...\"}.\n"
                 f"Earlier chapter summary: {chapter_so_far}\n"
-                f"New beats: {json.dumps([note['beat'] for note in notes[-12:]], ensure_ascii=False)}"
+                f"New beats: {json.dumps([note['beat'] for note in notes[summary_through:]], ensure_ascii=False)}"
             )
             if not isinstance(summary.get("summary"), str) or not summary["summary"].strip():
                 raise RuntimeError("Gemini omitted chapter continuity summary")
@@ -238,7 +256,7 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
                 raise RuntimeError(f"Gemini omitted or duplicated panels in analysis batch starting at {position}")
             batch_facts = {item["panel"]: item for item in facts}
         fact = batch_facts.pop(position)
-        if panel.get("ocr_ignore") or panel.get("ocr_flagged") or fact.get("needs_image"):
+        if panel.get("ocr_flagged") or fact.get("needs_image"):
             checked = _ask(
                 "Check this panel image against the existing factual beat. Correct visual actions and speaker "
                 "identity only when supported. Return one JSON object with keys beat, characters, new_threads, "
@@ -367,10 +385,10 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             if not overlong:
                 break
             rewrite = _ask(
-                "Shorten these spoken manhwa recap lines to strictly less than their max_words and max_chars "
-                "without adding facts or losing the key event. "
+                "Shorten these spoken lines. Rewrite each as one complete sentence. Keep the key event and add no facts. "
+                "Use at most max_words words and max_chars characters; count every word before returning. "
                 "Return JSON object {\"lines\":[{\"panel\":1,\"text\":\"...\"}]}.\n"
-                f"Lines and limits: {json.dumps([{**item, 'text': batch_lines.get(item['panel'], '')} for item in overlong], ensure_ascii=False)}",
+                f"Lines and limits: {json.dumps([{'panel': item['panel'], 'beat': item['beat'], 'text': batch_lines.get(item['panel'], ''), 'max_words': max(1, item['max_words'] * 3 // 4), 'max_chars': item['max_chars'] * 3 // 4} for item in overlong], ensure_ascii=False)}",
                 role="narration",
             )
             if not isinstance(rewrite.get("lines"), list):
@@ -382,8 +400,6 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             text = batch_lines.get(item["panel"])
             if not isinstance(text, str) or not text.strip():
                 raise RuntimeError(f"Narrator omitted panel {item['panel']}")
-            if len(text.split()) > item["max_words"] or len(text) > item["max_chars"]:
-                raise RuntimeError(f"Panel {item['panel']} exceeds its narration time budget")
             by_panel[item["panel"]] = text
         narration_batches.append([{"panel": item["panel"], "text": by_panel[item["panel"]]}
                                   for item in batch_plan if item["target_sec"]])
@@ -396,10 +412,26 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
             raise RuntimeError(f"Narrator omitted panel {note['panel']}")
 
     for item in plan:
-        item["words"] = len(by_panel.get(item["panel"], "").split())
+        text = by_panel.get(item["panel"], "")
+        item["words"] = len(text.split())
+        if item["target_sec"] and (item["words"] > item["max_words"] or len(text) > item["max_chars"]):
+            needed_sec = math.ceil(item["words"] * 60 / SPEAKING_WPM) + 1
+            if needed_sec > min(20, item["target_sec"] + 5):
+                raise RuntimeError(f"Panel {item['panel']} narration is {item['words']} words; "
+                                   f"maximum is {item['max_words']} words")
+            item["target_sec"] = max(item["target_sec"], needed_sec)
+            item["max_words"] = max(item["max_words"], item["words"])
+            item["max_chars"] = max(item["max_chars"], len(text))
+            print(f"⏱️ Panel {item['panel']} needs {item['target_sec']}s for narration", flush=True)
         item["estimated_sec"] = round(item["words"] * 60 / SPEAKING_WPM + (1 if item["words"] else 0), 1)
+    plan_file["planned_total_sec"] = sum(item["target_sec"] for item in plan)
     plan_file["estimated_total_sec"] = round(sum(item["estimated_sec"] for item in plan), 1)
     _save_json(plan_path, plan_file)
+
+    if bible.get("memory_version") == 2:
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
+        return notes, by_panel
 
     update = _ask(
         "Summarize factual chapter events from these notes. Return JSON object with summary (5-8 short lines as a list), "
@@ -421,3 +453,150 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
     if os.path.exists(progress_path):
         os.remove(progress_path)
     return notes, by_panel
+
+
+def polish_story_script(draft, notes, plan, bible, progress_path):
+    """Rewrite the complete draft into connected voiceover before TTS."""
+    signature = hashlib.sha256(json.dumps([7, draft, notes, plan, bible, STORY_MODEL, skill_fingerprint()],
+                                          sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    progress = {}
+    if os.path.exists(progress_path):
+        with open(progress_path, encoding="utf-8") as source:
+            progress = json.load(source)
+        if progress.get("signature") != signature:
+            progress = {}
+    progress.setdefault("signature", signature)
+    progress.setdefault("outline_batches", [])
+    for start in range(len(progress["outline_batches"]) * 22, len(notes), 22):
+        end = min(len(notes), start + 22)
+        outline = _ask(
+            "Turn this section into a chronological CAUSAL STORY OUTLINE. Preserve each distinct argument, "
+            "reply, confession, choice, revelation, and consequence. Combine decorative or repeated panels. "
+            "State speakers only when clear. Omit physical appearance, poses, expressions, scenery, colors, "
+            "sound effects, and credits. Do not invent motives or events. Return JSON "
+            "{\"events\":[\"event 1\",\"event 2\"]}.\n"
+            f"Earlier story: {bible.get('rolling_summary', '')}\n"
+            f"Previous events: {json.dumps([event for batch in progress['outline_batches'][-1:] for event in batch], ensure_ascii=False)}\n"
+            f"Beats: {json.dumps([{'panel': n['panel'], 'beat': n['beat']} for n in notes[start:end]], ensure_ascii=False)}\n"
+            f"Reviewed dialogue: {json.dumps([{'panel': x['story_panel'], 'ocr': x['ocr_text']} for x in draft if start < x['story_panel'] <= end and x.get('ocr_text')], ensure_ascii=False)}",
+            role="story-analysis",
+        )
+        events = outline.get("events")
+        if not isinstance(events, list) or not events or any(not isinstance(event, str) for event in events):
+            raise RuntimeError(f"Story outline returned no events for panels {start + 1}-{end}")
+        progress["outline_batches"].append(events)
+        _save_json(progress_path, progress)
+    progress["outline"] = [event for batch in progress["outline_batches"] for event in batch]
+    _save_json(progress_path, progress)
+    if not progress.get("story") and not progress.get("story_draft"):
+        word_budget = max(120, int(sum(x["max_words"] for x in plan["panels"]) * 0.6))
+        response = _ask(
+            "Write the complete chapter as one connected, spoken manhwa recap story. Begin from the previous "
+            "chapter's consequence when relevant; follow characters' choices, dialogue, causes and effects. "
+            "End with the chapter's real consequence. Use natural transitions, changing pace, and a conversational "
+            "recap voice like a story told aloud, not a panel tour. "
+            "Use confirmed names, relevant earlier story memory, and important dialogue meaning. "
+            "Ignore scanlation credits and watermarks; leave uncertain speakers unattributed. "
+            "Skip decorative or repeated beats. Never describe panels, images, poses, outfits, camera views, or OCR. "
+            "Do not invent events, dialogue, motives, or certainty. Write natural paragraphs, not panel notes or a list. "
+            f"Cover every causal event in approximately {min(word_budget, len(progress['outline']) * 25)} to {word_budget} spoken words, without padding. "
+            "Return JSON object {\"story\": \"...\"} with story as the complete prose narration.\n"
+            f"Series memory: {json.dumps({'story_so_far': bible.get('rolling_summary', ''), 'earlier_chapters': [{'id': c['id'], 'summary': c.get('summary', [])} for c in bible.get('chapters', [])[-3:]], 'characters': [{'id': c['id'], 'name': c.get('name'), 'aliases': c.get('aliases', []), 'role': c.get('role'), 'relations': c.get('relations', {}), 'review': c.get('review', False)} for c in bible.get('characters', [])], 'open_threads': bible.get('open_threads', []), 'timeline': bible.get('timeline', [])[-12:]}, ensure_ascii=False)}\n"
+            f"Causal events: {json.dumps(progress['outline'], ensure_ascii=False)}",
+            role="narration",
+        )
+        story_val = response.get("story")
+        if not story_val:
+            for k in ("prose", "narration", "chapter_story", "recap", "text", "story_draft", "story_narration"):
+                if isinstance(response.get(k), str) and response[k].strip():
+                    story_val = response[k]
+                    break
+            if not story_val and isinstance(response, dict):
+                vals = [v for v in response.values() if isinstance(v, str) and len(v.strip()) > 30]
+                if vals:
+                    story_val = "\n\n".join(vals)
+        if not isinstance(story_val, str) or not story_val.strip():
+            raise RuntimeError("Story writer returned no chapter story")
+        progress["story_draft"] = story_val
+        _save_json(progress_path, progress)
+    if not progress.get("story_cleaned"):
+        cleaned = _ask(
+            "Rewrite this draft as a person telling a friend the chapter's story. Keep the events, "
+            "causes, stakes, dialogue meaning, and uncertainty. Delete visual staging: what is shown, "
+            "poses, clothing, facial expressions, camera views, lighting, sound effects, and decorative actions. "
+            "If a detail changes no event or relationship, omit it. Do not add facts. "
+            "For example, 'A bloody hand appears against a dark backdrop' becomes 'His condition is worsening'; "
+            "'A spoon dips into porridge' is omitted unless the meal changes the interaction. "
+            "When a previous chapter exists, make the first sentence explicitly connect its ending to this "
+            "chapter's first event. Do not begin with only a time skip. "
+            "Keep spoken sentences under 40 words. Write connected spoken paragraphs with natural transitions. "
+            "Return JSON object {\"story\":\"...\"}.\n"
+            f"Previous story: {bible.get('rolling_summary', '')}\n"
+            f"Previous chapter: {json.dumps(bible.get('chapters', [])[-1:], ensure_ascii=False)}\n"
+            f"Draft story: {progress.get('story_draft') or progress['story']}",
+            role="narration",
+        )
+        clean_val = cleaned.get("story")
+        if not clean_val:
+            for k in ("prose", "narration", "cleaned_story", "recap", "text"):
+                if isinstance(cleaned.get(k), str) and cleaned[k].strip():
+                    clean_val = cleaned[k]
+                    break
+        if not isinstance(clean_val, str) or not clean_val.strip():
+            raise RuntimeError("Story cleanup returned no narration")
+        progress["story"] = clean_val
+        progress["story_cleaned"] = True
+        progress["batches"] = []
+        _save_json(progress_path, progress)
+    if not draft:
+        raise RuntimeError("No video panels available for the story")
+    passages = []
+    for sentence in re.split(r"(?<=[.!?])\s+", progress["story"].strip()):
+        words = sentence.split()
+        while words:
+            limit = min(40, len(words))
+            boundary = next((i for i in range(limit - 1, 23, -1) if words[i].endswith((",", ";", ":"))), None)
+            count = boundary + 1 if boundary is not None and len(words) > 40 else limit
+            passages.append(" ".join(words[:count]))
+            words = words[count:]
+    if len(passages) > len(draft):
+        raise RuntimeError(f"Story needs {len(passages)} scenes but only {len(draft)} video panels were approved")
+    if progress.get("passage_version") != 2:
+        progress["passage_version"] = 2
+        progress.pop("scene_ids", None)
+        _save_json(progress_path, progress)
+    scene_ids = progress.get("scene_ids", [])
+    for start in range(len(scene_ids), len(passages), 8):
+        batch = passages[start:start + 8]
+        response = _ask(
+            f"Match these {len(batch)} numbered spoken passages to exactly {len(batch)} approved video scenes. "
+            "The passages are final audio; do not rewrite them. Return one scene ID per passage, strictly "
+            "increasing, greater than the previous scene. Use verified beats and dialogue to match events. "
+            "Skip panels that add no story. Return JSON {\"scene_ids\":[1,3,5]}.\n"
+            f"Previous scene: {scene_ids[-1] if scene_ids else 0}\n"
+            f"Passages: {json.dumps([{'number': start + i + 1, 'text': text} for i, text in enumerate(batch)], ensure_ascii=False)}\n"
+            f"Approved scenes: {json.dumps([{'scene': i + 1, 'beat': notes[x['story_panel'] - 1]['beat'], 'ocr': x.get('ocr_text', '')} for i, x in enumerate(draft) if i + 1 > (scene_ids[-1] if scene_ids else 0)], ensure_ascii=False)}",
+            role="narration",
+        )
+        matches = response.get("scene_ids")
+        if not isinstance(matches, list) or len(matches) != len(batch):
+            raise RuntimeError(f"Scene matcher returned {len(matches) if isinstance(matches, list) else 0} "
+                               f"matches for passages {start + 1}-{start + len(batch)}")
+        try:
+            matches = [int(value) for value in matches]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Scene matcher returned a nonnumeric scene") from exc
+        if any(not 1 <= value <= len(draft) for value in matches):
+            raise RuntimeError("Scene matcher returned an unknown scene")
+        for offset, requested in enumerate(matches):
+            latest = len(draft) - (len(passages) - start - offset - 1)
+            scene_ids.append(min(latest, max((scene_ids[-1] + 1) if scene_ids else 1, requested)))
+        progress["scene_ids"] = scene_ids
+        _save_json(progress_path, progress)
+    polished = []
+    for text, scene_id in zip(passages, scene_ids):
+        original = draft[scene_id - 1]
+        needed_sec = math.ceil(len(text.split()) * 60 / SPEAKING_WPM) + 1
+        polished.append({**original, "panel": len(polished) + 1, "script": text,
+                         "target_sec": max(original["target_sec"], needed_sec)})
+    return polished, progress["story"]

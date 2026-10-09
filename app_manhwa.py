@@ -13,6 +13,7 @@ Pipeline Steps:
 """
 
 import os
+import math
 import sys
 import json
 import shutil
@@ -28,7 +29,9 @@ from core.manhwa_downloader import download_webtoon_url
 from core.comic_pdf import load_comic_images
 from core.manhwa_slicer import process_manhwa_images
 from core.comic_ocr import crosscheck_ocr, extract_ocr_text_from_panel
-from core.story_pipeline import STORY_MODEL, build_story_script, skill_fingerprint
+from core.story_pipeline import STORY_MODEL, build_story_script, polish_story_script, skill_fingerprint
+from core.series_workspace import prepare_series_workspace
+from core.series_memory import prior_memory, sync_series_memory
 from core.comic_animator import (
     generate_page_tts,
     build_ken_burns_video_segment,
@@ -59,6 +62,8 @@ def process_manhwa_recap_project(
     auto_approve: bool = False,
     re_review: bool = False,
     series_name: str = None,
+    script_only: bool = False,
+    all_panels: bool = True,
 ):
     """
     Main controller for the AI Manhwa Recap Production Pipeline.
@@ -73,7 +78,13 @@ def process_manhwa_recap_project(
     if series_name and not re.fullmatch(r"[\w-]+", series_name):
         raise ValueError("Series name may contain only letters, numbers, underscores, and hyphens")
 
-    project_dir = os.path.abspath(os.path.join("output", project_name))
+    output_root = os.path.abspath("output")
+    if series_name:
+        series_dir, chapter_dir = prepare_series_workspace(output_root, series_name, project_name)
+        project_dir = str(chapter_dir)
+    else:
+        series_dir = None
+        project_dir = os.path.join(output_root, project_name)
     os.makedirs(project_dir, exist_ok=True)
 
     state_mgr = StateManager(project_dir, source=source_input, force=force)
@@ -100,6 +111,8 @@ def process_manhwa_recap_project(
     ocr_json_path = os.path.join(data_dir, "ocr.json")
     ocr_txt_path = os.path.join(data_dir, "ocr_dialogue.txt")
     script_json_path = os.path.join(data_dir, "script.json")
+    draft_script_path = os.path.join(data_dir, "draft_script.json")
+    story_narrative_path = os.path.join(data_dir, "story_narrative.txt")
     master_script_txt_path = os.path.join(data_dir, "master_script.txt")
     scene_map_json_path = os.path.join(data_dir, "scene_map.json")
     master_audio_path = os.path.join(project_dir, "master_audio.mp3")
@@ -361,7 +374,9 @@ def process_manhwa_recap_project(
                 buf = f.read(65536)
         return hasher.hexdigest()
 
-    story_dir = os.path.abspath(os.path.join("output", series_name, "_story")) if series_name else project_dir
+    story_dir = str(series_dir) if series_dir else project_dir
+    if series_dir:
+        sync_series_memory(series_dir, stop_before=project_name)
     bible_path = os.path.join(story_dir, "data", "story_bible.json")
     beats_path = os.path.join(data_dir, "story_beats.json")
     plan_path = os.path.join(data_dir, "story_plan.json")
@@ -373,6 +388,14 @@ def process_manhwa_recap_project(
     story_params = {"pipeline": 4, "series": series_name, "model": STORY_MODEL, "skills": skill_fingerprint(),
                     "inputs": hashlib.sha256(json.dumps(story_inputs).encode("utf-8")).hexdigest(),
                     "prompt": hashlib.sha256((custom_prompt or "").encode("utf-8")).hexdigest()}
+
+    def write_master_script(items):
+        paragraphs = [f"# MANHWA RECAP: {project_name}"]
+        for start in range(0, len(items), 8):
+            paragraphs.append(" ".join(item["script"].strip() for item in items[start:start + 8]))
+        with open(master_script_txt_path, "w", encoding="utf-8") as output:
+            output.write("\n\n".join(paragraphs) + "\n")
+
     if state_mgr.is_step_completed("story_script", [script_json_path, bible_path, beats_path, plan_path], current_params=story_params):
         print("Story script already complete; using saved script.")
         with open(script_json_path, "r", encoding="utf-8") as f:
@@ -408,29 +431,80 @@ def process_manhwa_recap_project(
         # Save to data directory
         with open(script_json_path, "w", encoding="utf-8") as f:
             json.dump(script_items, f, indent=2, ensure_ascii=False)
-
-
-
-
-        # Consolidate readable master script
-        master_paragraphs = [f"# 📜 MANHWA RECAP MASTER SCRIPT: {project_name}\n"]
-        for item in script_items:
-            master_paragraphs.append(f"--- Scene {item['panel']:03d} ({item['file']}) [Mode: {item.get('framing_mode', 'contain').upper()}] ---")
-            if item.get("ocr_text"):
-                master_paragraphs.append(f"OCR Dialogue: \"{item['ocr_text']}\"")
-            master_paragraphs.append(f"Narrator Script: {item['script']}\n")
-
-        with open(master_script_txt_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(master_paragraphs))
+        with open(draft_script_path, "w", encoding="utf-8") as f:
+            json.dump(script_items, f, indent=2, ensure_ascii=False)
+        write_master_script(script_items)
 
         state_mgr.mark_step_completed("story_script", result_files=[script_json_path, master_script_txt_path, bible_path, beats_path, plan_path], params=story_params)
         print(f"✅ Master Script generated:\n  📄 {script_json_path}\n  📄 {master_script_txt_path}")
         print(f"⏱️ Estimated narration: {story_plan['estimated_total_sec'] / 60:.1f} minutes across {len(script_items)} video panels")
 
+    if not os.path.exists(draft_script_path):
+        with open(draft_script_path, "w", encoding="utf-8") as f:
+            json.dump(script_items, f, indent=2, ensure_ascii=False)
+    with open(draft_script_path, encoding="utf-8") as f:
+        draft_items = json.load(f)
+    with open(bible_path, encoding="utf-8") as f:
+        story_bible = json.load(f)
+    story_context = prior_memory(story_bible, project_name) if series_dir else story_bible
+    memory_hash = hashlib.sha256(json.dumps(story_context, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    edit_params = {"draft": get_file_md5(draft_script_path), "memory": memory_hash, "model": STORY_MODEL,
+                   "skill": skill_fingerprint(), "editor": 9, "all_panels": all_panels}
+    if state_mgr.is_step_completed("story_edit", [script_json_path, master_script_txt_path, story_narrative_path], current_params=edit_params):
+        print("⏩ Story edit already completed (cached).")
+        with open(script_json_path, "r", encoding="utf-8") as f:
+            script_items = json.load(f)
+    else:
+        print("✍️ Editing full chapter story before voice generation...")
+        with open(beats_path, encoding="utf-8") as f:
+            story_notes = json.load(f)
+        with open(plan_path, encoding="utf-8") as f:
+            story_plan = json.load(f)
+        if all_panels:
+            print(f"🎬 Preserving all {len(draft_items)} approved video panels for comprehensive recap.")
+            script_items = []
+            for idx, item in enumerate(draft_items):
+                it = dict(item)
+                it["panel"] = idx + 1
+                words = len(it["script"].split())
+                needed_sec = math.ceil(words * 60 / story_plan.get("speaking_wpm", 145)) + 2
+                it["target_sec"] = max(it.get("target_sec", 6), needed_sec)
+                script_items.append(it)
+            story = "\n\n".join(it["script"] for it in script_items)
+        else:
+            script_items, story = polish_story_script(draft_items, story_notes, story_plan, story_context,
+                                                      os.path.join(data_dir, "story_edit_progress.json"))
+        for item in script_items:
+            scene_plan = story_plan["panels"][item["story_panel"] - 1]
+            scene_plan["target_sec"] = item["target_sec"]
+            scene_plan["words"] = len(item["script"].split())
+            scene_plan["max_words"] = max(scene_plan["max_words"], scene_plan["words"])
+            scene_plan["max_chars"] = max(scene_plan["max_chars"], len(item["script"]))
+            scene_plan["estimated_sec"] = round(scene_plan["words"] * 60 / story_plan["speaking_wpm"] + 1, 1)
+        story_plan["planned_total_sec"] = sum(item["target_sec"] for item in script_items)
+        story_plan["estimated_total_sec"] = round(sum(len(item["script"].split()) * 60 / story_plan["speaking_wpm"] + 1 for item in script_items), 1)
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(story_plan, f, indent=2, ensure_ascii=False)
+        with open(script_json_path, "w", encoding="utf-8") as f:
+            json.dump(script_items, f, indent=2, ensure_ascii=False)
+        with open(story_narrative_path, "w", encoding="utf-8") as f:
+            f.write(story.strip() + "\n")
+        write_master_script(script_items)
+        state_mgr.mark_step_completed("story_edit", result_files=[script_json_path, master_script_txt_path, story_narrative_path], params=edit_params)
+        print(f"✅ Full story: {story_narrative_path}\n✅ Spoken script: {master_script_txt_path}")
+    if series_dir:
+        sync_series_memory(series_dir, through=project_name)
+    if script_only:
+        state_mgr.set_project_status("SCRIPT_READY")
+        print(f"📖 Story ready for review: {story_narrative_path}")
+        print(f"🎙️ Spoken script ready for review: {master_script_txt_path}")
+        return master_script_txt_path
+
     # -------------------------------------------------------------------------
     # STEP 5 & 6: PARALLEL TTS AUDIO + VIDEO CLIP RENDERING
     # -------------------------------------------------------------------------
-    print(f"\n🎙️🎬 [5/6 & 6/6] Steps 'video_render': Multi-Mode Video Clip Rendering ({workers} workers)...")
+    total_scenes = len(script_items)
+    print(f"\n🎙️🎬 [5/6 & 6/6] Steps 'video_render': Multi-Mode Video Clip Rendering ({total_scenes} scenes, {workers} workers)...")
     render_params = {"aspect": aspect, "voice": voice, "script": get_file_md5(script_json_path), "renderer": 2}
     if state_mgr.is_step_completed("video_render", [final_video_path, master_audio_path], current_params=render_params):
         print(f"⏩ [5/6 & 6/6] Steps already COMPLETED (cached). Skipping.")
@@ -446,12 +520,12 @@ def process_manhwa_recap_project(
             segment_video_path = os.path.join(clips_dir, f"clip_{panel_num:03d}.mp4")
             anim_preset = PRESETS[idx % len(PRESETS)]
 
-            print(f"  ⚡ [Render Scene {panel_num}/{total_panels}] Mode: {framing_mode} | Preset: {anim_preset}...", flush=True)
+            print(f"  ⚡ [Render Scene {panel_num}/{total_scenes}] Mode: {framing_mode} | Preset: {anim_preset}...", flush=True)
 
             # 1. Synthesize TTS
             generate_page_tts(narrator_text, segment_audio_path, voice=voice)
             audio_duration = get_audio_duration_sec(segment_audio_path)
-            if audio_duration > min(20, item["target_sec"] + 5):
+            if audio_duration > min(25, item["target_sec"] + 5):
                 raise ValueError(f"Panel {panel_num} audio is {audio_duration:.1f}s, over its {item['target_sec']}s story budget")
 
             # 2. Render Video Clip
@@ -544,7 +618,10 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-run all steps bypassing state cache")
     parser.add_argument("--fps", type=int, help="Video FPS (default: 30)", default=30)
     parser.add_argument("--prompt", help="Custom prompt instructions for script writer", default=None)
-    parser.add_argument("--series", help="Share story bible across chapters under output/SERIES/_story", default=None)
+    parser.add_argument("--series", help="Store chapters and shared story memory under output/SERIES", default=None)
+    parser.add_argument("--script-only", action="store_true", help="Write story and script, then stop before audio/video")
+    parser.add_argument("--all-panels", dest="all_panels", action="store_true", default=True, help="Preserve all approved video panels in recap video (default: True)")
+    parser.add_argument("--compress-story", dest="all_panels", action="store_false", help="Compress recap down to 10-15 panels using condensed story summary")
 
     args = parser.parse_args()
 
@@ -567,6 +644,8 @@ def main():
             auto_approve=args.auto_approve,
             re_review=args.re_review,
             series_name=args.series,
+            script_only=args.script_only,
+            all_panels=args.all_panels,
         )
     except Exception as e:
         print(f"\n❌ Error executing Manhwa Recap engine: {e}")

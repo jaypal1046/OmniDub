@@ -16,7 +16,8 @@ def main():
     parser.add_argument("--height", type=int, help="Video height (default: 1920)", default=1920)
     parser.add_argument("--fps", type=int, help="Video FPS (default: 30)", default=30)
     parser.add_argument("--prompt", help="Custom prompt style instructions for Gemini script writer", default=None)
-    parser.add_argument("--series", help="Share story bible across chapters under output/SERIES/_story", default=None)
+    parser.add_argument("--series", help="Store chapters and shared story memory under output/SERIES", default=None)
+    parser.add_argument("--script-only", action="store_true", help="Write story and script, then stop before audio/video")
 
     args = parser.parse_args()
 
@@ -34,7 +35,8 @@ def main():
             mode=args.mode,
             enable_ocr=not args.no_ocr,
             custom_prompt=args.prompt,
-            series_name=args.series
+            series_name=args.series,
+            script_only=args.script_only,
         )
     except Exception as e:
         print(f"❌ Failed to generate {args.mode} recap: {e}")

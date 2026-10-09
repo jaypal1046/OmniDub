@@ -8,10 +8,120 @@ from PIL import Image
 
 from core.comic_animator import get_audio_duration_sec
 from core.comic_script import get_active_vision_provider
-from core.story_pipeline import _ask, _image_parts, _reference_path, build_story_script
+from core.story_pipeline import _ask, _image_parts, _reference_path, build_story_script, polish_story_script
 
 
 class StoryPipelineTest(unittest.TestCase):
+    def test_story_edit_uses_story_as_audio_and_skips_filler_panels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            draft = [{"panel": number, "story_panel": number, "script": "A hand is shown.", "ocr_text": "", "target_sec": 4}
+                     for number in range(1, 14)]
+            notes = [{"panel": number, "beat": "She finds a clue.", "action": "INCLUDE"}
+                     for number in range(1, 14)]
+            plan = {"panels": [{"max_words": 10} for _ in draft]}
+            calls = []
+
+            def answer(prompt, images=(), role="story-analysis"):
+                self.assertEqual(role, "story-analysis" if "CAUSAL STORY OUTLINE" in prompt else "narration")
+                calls.append(prompt)
+                if "CAUSAL STORY OUTLINE" in prompt:
+                    return {"events": ["She finds a clue.", "She follows it."]}
+                if "Write the complete chapter" in prompt:
+                    return {"story": "She finds a clue and follows it to its source."}
+                if "Rewrite this draft" in prompt:
+                    return {"story": "She follows the clue to its source."}
+                if len(calls) == 4:
+                    raise RuntimeError("temporary failure")
+                return {"scene_ids": [7]}
+
+            progress = str(root / "edit_progress.json")
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                with self.assertRaisesRegex(RuntimeError, "temporary failure"):
+                    polish_story_script(draft, notes, plan, {}, progress)
+                edited, story = polish_story_script(draft, notes, plan, {}, progress)
+            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(edited), 1)
+            self.assertEqual(edited[0]["script"], "She follows the clue to its source.")
+            self.assertEqual(edited[0]["story_panel"], 7)
+            self.assertEqual(edited[0]["panel"], 1)
+            self.assertIn("follows the clue to its source", story)
+            self.assertEqual(draft[0]["script"], "A hand is shown.")
+
+    def test_story_edit_never_reuses_visual_draft(self):
+        with tempfile.TemporaryDirectory() as directory:
+            draft = [{"panel": 1, "story_panel": 1, "script": "A glowing hand is shown.",
+                      "ocr_text": "", "target_sec": 4}]
+            notes = [{"panel": 1, "beat": "She attempts to heal him.", "action": "INCLUDE"}]
+            plan = {"panels": [{"max_words": 5}]}
+
+            def answer(prompt, images=(), role="story-analysis"):
+                if "CAUSAL STORY OUTLINE" in prompt:
+                    return {"events": ["She heals him."]}
+                if "Write the complete chapter" in prompt:
+                    return {"story": "She attempts to heal him, although he has little hope."}
+                if "Rewrite this draft" in prompt:
+                    return {"story": "She attempts to heal him despite his doubts."}
+                return {"scene_ids": [1]}
+
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                edited, _ = polish_story_script(draft, notes, plan, {}, str(Path(directory) / "progress.json"))
+            self.assertEqual(edited[0]["script"], "She attempts to heal him despite his doubts.")
+
+    def test_story_edit_aligns_scenes_when_story_panel_numbers_skip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            draft = [{"panel": 1, "story_panel": 1, "script": "A door opens.", "ocr_text": "", "target_sec": 4},
+                     {"panel": 2, "story_panel": 3, "script": "A letter appears.", "ocr_text": "", "target_sec": 4}]
+            notes = [{"panel": 1, "beat": "She enters.", "action": "INCLUDE"},
+                     {"panel": 2, "beat": "The sender remains unknown.", "action": "STORY_ONLY"},
+                     {"panel": 3, "beat": "She finds a letter.", "action": "INCLUDE"}]
+            plan = {"panels": [{"max_words": 10} for _ in notes]}
+            attempts = []
+
+            def answer(prompt, images=(), role="story-analysis"):
+                if "CAUSAL STORY OUTLINE" in prompt:
+                    return {"events": ["She finds a letter."]}
+                if "Write the complete chapter" in prompt:
+                    return {"story": "She enters and finds a mysterious letter."}
+                if "Rewrite this draft" in prompt:
+                    return {"story": "She finds a mysterious letter after entering."}
+                attempts.append(prompt)
+                return {"scene_ids": [2]}
+
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                edited, _ = polish_story_script(draft, notes, plan, {}, str(Path(directory) / "progress.json"))
+            self.assertEqual([x["script"] for x in edited], ["She finds a mysterious letter after entering."])
+            self.assertEqual(edited[0]["story_panel"], 3)
+            self.assertEqual(len(attempts), 1)
+
+    def test_story_cleanup_resumes_from_saved_draft(self):
+        with tempfile.TemporaryDirectory() as directory:
+            draft = [{"panel": 1, "story_panel": 1, "script": "A hand is shown.",
+                      "ocr_text": "", "target_sec": 4}]
+            notes = [{"panel": 1, "beat": "She helps him.", "action": "INCLUDE"}]
+            plan = {"panels": [{"max_words": 10}]}
+            calls = []
+
+            def answer(prompt, images=(), role="story-analysis"):
+                calls.append(prompt)
+                if "CAUSAL STORY OUTLINE" in prompt:
+                    return {"events": ["She helps him."]}
+                if "Write the complete chapter" in prompt:
+                    return {"story": "A hand is shown as she helps him."}
+                if "Rewrite this draft" in prompt:
+                    if len(calls) == 3:
+                        raise RuntimeError("temporary failure")
+                    return {"story": "She helps him."}
+                return {"scene_ids": [1]}
+
+            progress = str(Path(directory) / "progress.json")
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                with self.assertRaisesRegex(RuntimeError, "temporary failure"):
+                    polish_story_script(draft, notes, plan, {}, progress)
+                _, story = polish_story_script(draft, notes, plan, {}, progress)
+            self.assertEqual(story, "She helps him.")
+            self.assertEqual(sum("Write the complete chapter" in call for call in calls), 1)
+
     def test_missing_audio_cannot_become_three_second_clip(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "missing or empty"):
@@ -67,6 +177,44 @@ class StoryPipelineTest(unittest.TestCase):
         ) as post, patch("core.story_pipeline.time.sleep"):
             self.assertEqual(_ask("facts"), {"beat": "ok"})
             self.assertEqual(post.call_count, 2)
+
+    def test_rate_limit_waits_for_retry_after(self):
+        class Response:
+            def __init__(self, status):
+                self.status_code = status
+                self.ok = status == 200
+                self.headers = {"Retry-After": "3"} if status == 429 else {}
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": '{"beat":"ok"}'}]}}]}
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test"}), patch(
+            "core.story_pipeline.requests.post", side_effect=[Response(429), Response(200)]
+        ) as post, patch("core.story_pipeline.time.sleep") as sleep:
+            self.assertEqual(_ask("facts"), {"beat": "ok"})
+            self.assertEqual(post.call_count, 2)
+            sleep.assert_called_once_with(3.0)
+
+    def test_rate_limit_reads_gemini_retry_delay(self):
+        class RateLimited:
+            ok = False
+            status_code = 429
+            headers = {}
+
+            def json(self):
+                return {"error": {"details": [{"retryDelay": "12s"}]}}
+
+        class Success:
+            ok = True
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": '{"beat":"ok"}'}]}}]}
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test"}), patch(
+            "core.story_pipeline.requests.post", side_effect=[RateLimited(), Success()]
+        ), patch("core.story_pipeline.time.sleep") as sleep:
+            self.assertEqual(_ask("facts"), {"beat": "ok"})
+            sleep.assert_called_once_with(12.0)
 
     def test_request_failure_reports_cause(self):
         import requests
@@ -211,6 +359,32 @@ class StoryPipelineTest(unittest.TestCase):
             self.assertIn("Jin found a mysterious letter", calls[3][0])
             self.assertEqual(len(calls[3][1]), 2)
 
+    def test_series_memory_is_not_overwritten_by_draft_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            story = root / "series"
+            data = story / "data"
+            data.mkdir(parents=True)
+            bible_path = data / "story_bible.json"
+            original = {"memory_version": 2, "characters": [], "chapters": [], "open_threads": [],
+                        "timeline": [], "rolling_summary": "Earlier chapter happened."}
+            bible_path.write_text(json.dumps(original), encoding="utf-8")
+            image = root / "panel.png"
+            Image.new("RGB", (10, 10), "red").save(image)
+            panel = {"file": "panel.png", "image_path": str(image), "ocr_text": "", "action": "INCLUDE"}
+
+            def answer(prompt, images=(), role="story-analysis"):
+                if "factual manhwa story analyst" in prompt:
+                    return {"panels": [{"panel": 1, "beat": "She returns.", "characters": [],
+                                        "new_threads": [], "resolved_threads": [], "timeline_event": None}]}
+                if "recap storyteller" in prompt:
+                    return {"lines": [{"panel": 1, "text": "She returns."}]}
+                raise AssertionError("Legacy memory writer was called")
+
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                build_story_script(str(root / "chapter"), "chapter", [panel], story_dir=str(story))
+            self.assertEqual(json.loads(bible_path.read_text(encoding="utf-8")), original)
+
     def test_resume_starts_at_failed_panel(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -276,7 +450,31 @@ class StoryPipelineTest(unittest.TestCase):
             self.assertEqual(set(script), {1, 2, 4})
             self.assertEqual(len(rewrites), 1)
 
-    def test_batch_sees_every_image_and_checks_image_only_panel(self):
+    def test_narration_that_resists_shortening_gets_bounded_extra_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "panel.png"
+            Image.new("RGB", (10, 10), "red").save(image)
+            panel = {"file": image.name, "image_path": str(image), "action": "INCLUDE", "ocr_text": ""}
+            line = "She takes the letter and finally learns who sent it."
+
+            def answer(prompt, images=(), role="story-analysis"):
+                if "factual manhwa story analyst" in prompt:
+                    return {"panels": [{"panel": 1, "beat": "She learns who sent the letter.",
+                                        "importance": 0, "characters": [], "new_threads": [],
+                                        "resolved_threads": [], "timeline_event": None}]}
+                if role == "narration":
+                    return {"lines": [{"panel": 1, "text": line}]}
+                return {"summary": ["She learns the sender."], "rolling_summary": "She knows the sender.", "relations": []}
+
+            with patch("core.story_pipeline._ask", side_effect=answer):
+                _, script = build_story_script(str(root), "chapter", [panel])
+            plan = json.loads((root / "data" / "story_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(script[1], line)
+            self.assertEqual(plan["panels"][0]["target_sec"], 6)
+            self.assertEqual(plan["planned_total_sec"], 6)
+
+    def test_batch_sees_image_only_panel_and_rechecks_flagged_ocr(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             panels = []
@@ -284,7 +482,7 @@ class StoryPipelineTest(unittest.TestCase):
                 path = root / f"{number}.png"
                 Image.new("RGB", (100, 100), "red").save(path)
                 panels.append({"file": path.name, "image_path": str(path), "action": "INCLUDE",
-                               "ocr_text": ocr, "ocr_ignore": number == 3})
+                               "ocr_text": ocr, "ocr_ignore": number == 3, "ocr_flagged": number == 2})
             analysis_images = []
             narrator_prompt = []
 
@@ -305,8 +503,9 @@ class StoryPipelineTest(unittest.TestCase):
 
             with patch("core.story_pipeline._ask", side_effect=answer):
                 notes, _ = build_story_script(str(root), "chapter", panels)
-            self.assertEqual(analysis_images, [["1.png", "2.png", "3.png"], ["3.png"]])
-            self.assertEqual(notes[2]["beat"], "A crash ends the conversation.")
+            self.assertEqual(analysis_images, [["1.png", "2.png", "3.png"], ["2.png"]])
+            self.assertEqual(notes[1]["beat"], "A crash ends the conversation.")
+            self.assertEqual(notes[2]["beat"], "Event 3.")
             self.assertIn('"panel": 1, "text": "Hello"', narrator_prompt[0])
             self.assertIn('"panel": 3, "text": ""', narrator_prompt[0])
 

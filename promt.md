@@ -29,3 +29,14 @@ DUBBING RULES:
 * Don't Change output format
 
 
+
+
+
+
+
+### CHAPTER ANALYSIS & RECAP WORKFLOW PROMPT:
+Inspect the panel images in images/panels in data/panel_manifest.json order. Use data/ocr.json and the shared ../../data/story_bible.json.
+Identify characters (present & flashback forms), important dialogue, causal narrative events, flashbacks/world lore, and uncertain claims.
+Ground all observations in direct visual pixel inspection rather than raw OCR text alone.
+Save the structured results as data/antigravity_analysis.json.
+After confirming the analysis, run the production pipeline to render the video recap (FINAL_MANHWA_RECAP.mp4).
