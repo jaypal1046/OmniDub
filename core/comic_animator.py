@@ -167,13 +167,17 @@ def _build_filter_complex(
 
     lines = textwrap.wrap(subtitle_text, width=55, break_long_words=False) or [""]
     for index, line in enumerate(lines):
-        clean = (line.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
-                 .replace('"', '\\"').replace("%", "\\%"))
+        clean = (
+            line.replace("\\", "\\\\")
+            .replace("'", "’")
+            .replace(":", "\\:")
+            .replace("%", "\\%")
+        )
         source = "base" if index == 0 else f"sub{index}"
         target = "v" if index == len(lines) - 1 else f"sub{index + 1}"
         offset = 70 + (len(lines) - 1 - index) * 52
         filter_complex += (f";[{source}]drawtext=text='{clean}':fontcolor=white:fontsize=36:"
-                           f"box=1:boxcolor=black@0.75:boxborderw=10:x=(w-text_w)/2:"
+                           f"box=1:boxcolor=black@0.45:boxborderw=10:x=(w-text_w)/2:"
                            f"y=h-text_h-{offset}:fix_bounds=true[{target}]")
     return filter_complex
 
