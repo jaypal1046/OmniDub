@@ -17,6 +17,28 @@ def _extract_best_url_from_srcset(srcset: str) -> str:
     return best_url
 
 
+def _is_suspicious_ui_or_ad(src: str, alt: str = "", is_reader_panel: bool = False) -> bool:
+    """Checks if an image URL is UI chrome, icons, or ads rather than story panels."""
+    if is_reader_panel:
+        return False
+
+    src_l = src.lower()
+    alt_l = alt.lower()
+
+    if any(k in alt_l for k in ["page ", "chapter ", "page-", "chapter-"]):
+        return False
+
+    # Check for known UI/social icons and tracking
+    if any(k in src_l for k in ["logo", "avatar", "icon", "favicon", "button", "badge", "emotes", "sticker", "disqus", "discord", "patreon"]):
+        return True
+
+    # Word-boundary or slash-separated ad patterns (DO NOT use simple "ad-" as hex UUIDs like 9aad- contain it)
+    if re.search(r'[/._-](?:ads?|advertisement|banner)[-._/]', src_l):
+        return True
+
+    return False
+
+
 def download_with_playwright(url, output_dir):
     """
     Uses Playwright headless browser to render any dynamic Webtoon / Manhwa website,
@@ -94,11 +116,8 @@ def download_with_playwright(url, output_dir):
                 if is_excluded:
                     continue
 
-                if any(bad in src.lower() for bad in ["logo", "avatar", "icon", "banner", "favicon", "ad-", "button", "badge", "emotes", "sticker", "discord", "patreon"]):
-                    continue
-
                 # Check positive indicators for Manhwa panel images
-                has_parent_reader = img.evaluate("""el => el.closest('[data-page], #readerarea, .rdcontainer, .reading-content, .chapter-content, [class*="reader"], [id*="reader"], main') !== null""")
+                has_parent_reader = img.evaluate("""el => el.closest('[data-page], [data-reader-page-image], #readerarea, .comic-images-wrapper, .comic-body-container, .rdcontainer, .reading-content, .chapter-content, [class*="reader"], [id*="reader"], main') !== null""")
                 
                 is_valid_panel = (
                     has_parent_reader or
@@ -106,6 +125,9 @@ def download_with_playwright(url, output_dir):
                     ("page" in alt.lower()) or
                     any(k in src.lower() for k in ["/chapters/", "/chapter/", "/pages/", "/page/", "/uploads/manga/", "/uploads/series/", "/img/"])
                 )
+
+                if _is_suspicious_ui_or_ad(src, alt=alt, is_reader_panel=is_valid_panel):
+                    continue
 
                 if is_valid_panel:
                     img_urls.append(src)
@@ -120,7 +142,7 @@ def download_with_playwright(url, output_dir):
 
             # Download extracted image files
             for i, img_url in enumerate(unique_urls):
-                ext = ".png" if ".png" in img_url.lower() else ".jpg"
+                ext = ".webp" if ".webp" in img_url.lower() else (".png" if ".png" in img_url.lower() else ".jpg")
                 filename = f"page_{i+1:03d}{ext}"
                 filepath = os.path.join(output_dir, filename)
 
@@ -182,11 +204,13 @@ def download_with_requests(url, output_dir):
         soup = BeautifulSoup(response.text, "html.parser")
         img_urls = []
 
-        reader_container = (
-            soup.find(id="readerarea") or 
-            soup.find(class_=re.compile(r"reader|rdcontainer|chapter-content|reading-content", re.I)) or 
-            soup
-        )
+        candidate_containers = [
+            soup.find(id="readerarea"),
+            soup.find(class_=re.compile(r"comic-images-wrapper|comic-body-container|comic-reader-stage", re.I)),
+            soup.find("article", class_=re.compile(r"immersive-reader|reader", re.I)),
+            soup.find(class_=re.compile(r"\b(?:rdcontainer|chapter-content|reading-content|entry-content)\b", re.I)),
+        ]
+        reader_container = next((c for c in candidate_containers if c and c.name not in ["body", "html"]), soup)
 
         for img in reader_container.find_all("img"):
             src = (
@@ -196,8 +220,8 @@ def download_with_requests(url, output_dir):
                 img.get("data-original") or ""
             )
             srcset = img.get("srcset") or img.get("data-srcset") or ""
-            alt = img.get("alt", "")
-            data_page = img.get("data-page") or img.get("data-page-index") or ""
+            alt = (img.get("alt") or "").strip()
+            data_page = img.get("data-page") or img.get("data-page-index") or img.get("data-reader-index") or ""
 
             if (not src or src.startswith("data:")) and srcset:
                 src = _extract_best_url_from_srcset(srcset)
@@ -212,30 +236,32 @@ def download_with_requests(url, output_dir):
             elif src.startswith("/"):
                 src = url.split("/")[0] + "//" + url.split("/")[2] + src
 
-            if any(bad in src.lower() for bad in ["logo", "avatar", "icon", "banner", "favicon", "ad-", "button", "badge", "emotes", "disqus", "discord"]):
-                continue
+            is_reader_panel = bool(
+                img.get("data-reader-page-image") or
+                data_page != "" or
+                ("page " in alt.lower()) or
+                (img.parent and any("image-container" in c for c in (img.parent.get("class") or []))) or
+                any(k in src.lower() for k in ["/chapters/", "/chapter/", "/pages/", "/page/", "/uploads/manga/", "/uploads/series/"])
+            )
 
             parent_classes = " ".join([c for c in (img.parent.get("class") or [])]) if img.parent else ""
-            if any(c in parent_classes.lower() for c in ["comment", "avatar", "profile", "sidebar", "footer", "header"]):
+            if not is_reader_panel and any(c in parent_classes.lower() for c in ["comment", "avatar", "profile", "sidebar", "footer", "header", "navbar", "featured"]):
+                continue
+
+            if _is_suspicious_ui_or_ad(src, alt=alt, is_reader_panel=is_reader_panel):
                 continue
 
             if (
-                data_page or
+                is_reader_panel or
                 reader_container != soup or
-                ("page" in alt.lower()) or
-                any(k in src.lower() for k in ["/chapters/", "/chapter/", "/pages/", "/page/", "/uploads/manga/", "/img/"])
+                ("page" in alt.lower())
             ):
                 img_urls.append(src)
 
         unique_urls = list(dict.fromkeys(img_urls))
 
         for i, img_url in enumerate(unique_urls):
-            ext = ".jpg"
-            if ".png" in img_url.lower():
-                ext = ".png"
-            elif ".webp" in img_url.lower():
-                ext = ".webp"
-
+            ext = ".webp" if ".webp" in img_url.lower() else (".png" if ".png" in img_url.lower() else ".jpg")
             filepath = os.path.join(output_dir, f"page_{i+1:03d}{ext}")
             try:
                 img_res = requests.get(img_url, headers=headers, timeout=20)
@@ -252,6 +278,123 @@ def download_with_requests(url, output_dir):
     return downloaded_files
 
 
+def download_with_curl_cffi(url, output_dir):
+    """
+    High-speed Cloudflare-bypassing scraper using curl_cffi.
+    Impersonates real desktop browser TLS fingerprint to bypass Cloudflare / DDOS protections.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return []
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": url,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+
+    try:
+        print(f"⚡ Fetching page via Cloudflare-bypass TLS engine...")
+        res = cffi_requests.get(url, impersonate="chrome124", headers=headers, timeout=25)
+        if res.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        # Look for reader containers, strictly excluding <body> and <html>
+        candidate_containers = [
+            soup.find(id="readerarea"),
+            soup.find(class_=re.compile(r"comic-images-wrapper|comic-body-container|comic-reader-stage", re.I)),
+            soup.find("article", class_=re.compile(r"immersive-reader|reader", re.I)),
+            soup.find(class_=re.compile(r"\b(?:rdcontainer|chapter-content|reading-content|entry-content)\b", re.I)),
+        ]
+        reader_container = next((c for c in candidate_containers if c and c.name not in ["body", "html"]), soup)
+
+        img_urls = []
+        for img in reader_container.find_all("img"):
+            src = (
+                img.get("data-src") or 
+                img.get("src") or 
+                img.get("data-url") or 
+                img.get("data-original") or ""
+            ).strip()
+
+            srcset = (img.get("srcset") or img.get("data-srcset") or "").strip()
+            if (not src or src.startswith("data:")) and srcset:
+                src = _extract_best_url_from_srcset(srcset)
+
+            if not src or src.startswith("data:"):
+                continue
+
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = url.split("/")[0] + "//" + url.split("/")[2] + src
+
+            alt = (img.get("alt") or "").strip()
+            is_reader_panel = bool(
+                img.get("data-reader-page-image") or
+                img.get("data-reader-index") is not None or
+                img.get("data-page") or
+                img.get("data-page-index") or
+                ("page" in alt.lower()) or
+                (img.parent and any("image-container" in c for c in (img.parent.get("class") or []))) or
+                any(k in src.lower() for k in ["/chapters/", "/chapter/", "/pages/", "/page/", "/uploads/manga/", "/uploads/series/"])
+            )
+
+            parent_classes = " ".join([c for c in (img.parent.get("class") or [])]) if img.parent else ""
+            if not is_reader_panel and any(c in parent_classes.lower() for c in ["comment", "avatar", "profile", "sidebar", "footer", "header", "navbar", "featured"]):
+                continue
+
+            # Exclude header/nav elements if not explicitly a reader panel
+            if not is_reader_panel:
+                p = img.parent
+                in_ui_shell = False
+                while p and p.name != "[document]":
+                    if p.name in ["header", "nav", "footer"] or any(k in " ".join(p.get("class") or []).lower() for k in ["navbar", "featured", "comment", "sidebar"]):
+                        in_ui_shell = True
+                        break
+                    p = p.parent
+                if in_ui_shell:
+                    continue
+
+            if _is_suspicious_ui_or_ad(src, alt=alt, is_reader_panel=is_reader_panel):
+                continue
+
+            img_urls.append(src)
+
+        unique_urls = list(dict.fromkeys(img_urls))
+        if not unique_urls:
+            return []
+
+        print(f"📸 Identified {len(unique_urls)} chapter images via Cloudflare bypass. Downloading...")
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_one(item):
+            idx, img_url = item
+            ext = ".webp" if ".webp" in img_url.lower() else (".png" if ".png" in img_url.lower() else ".jpg")
+            filepath = os.path.join(output_dir, f"page_{idx+1:03d}{ext}")
+            try:
+                img_res = cffi_requests.get(img_url, impersonate="chrome124", headers=headers, timeout=25)
+                if img_res.status_code == 200 and len(img_res.content) > 2000:
+                    with open(filepath, "wb") as f:
+                        f.write(img_res.content)
+                    return filepath
+            except Exception:
+                pass
+            return None
+
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            downloaded_files = [f for f in executor.map(_fetch_one, enumerate(unique_urls)) if f]
+
+        return downloaded_files
+    except Exception:
+        return []
+
+
 def download_webtoon_url(url, output_dir):
     """
     Main Downloader entrypoint for any Webtoon / Manhwa chapter URL.
@@ -259,7 +402,14 @@ def download_webtoon_url(url, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     print(f"\n📥 Step 1: Downloading Manhwa chapter from website: {url}")
     
-    files = download_with_playwright(url, output_dir)
+    # 1. Try TLS Cloudflare-bypass scraper (fastest & handles Turnstile/anti-bot sites)
+    files = download_with_curl_cffi(url, output_dir)
+    
+    # 2. Fallback to Playwright headless browser
+    if not files:
+        files = download_with_playwright(url, output_dir)
+        
+    # 3. Fallback to standard HTTP requests scraper
     if not files:
         print("⚠️ Retrying download using fallback HTTP scraper...")
         files = download_with_requests(url, output_dir)

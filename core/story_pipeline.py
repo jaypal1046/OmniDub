@@ -17,11 +17,27 @@ from PIL import Image
 from .comic_script import clean_json_response
 
 
-STORY_MODEL = "gemini-3.5-flash-lite"
+STORY_MODEL = "gemini-3.1-flash-lite"
+STORY_MODELS = [STORY_MODEL, "gemini-3.6-flash", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash-lite"]
 SPEAKING_WPM = 145
 PANEL_SECONDS = (4, 6, 9, 13)
 ANALYSIS_BATCH_SIZE = 6
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
+
+
+def get_gemini_api_keys():
+    """Retrieve all available Gemini API keys in priority order for automatic failover."""
+    keys = []
+    primary = os.environ.get("GEMINI_API_KEY")
+    if primary and primary.strip():
+        keys.append(primary.strip())
+    secondary = os.environ.get("GEMINI_API_KEY2")
+    if secondary and secondary.strip() and secondary.strip() not in keys:
+        keys.append(secondary.strip())
+    for k, v in os.environ.items():
+        if k.startswith("GEMINI_API_KEY") and v.strip() and v.strip() not in keys:
+            keys.append(v.strip())
+    return keys
 
 
 def _skill_text(role):
@@ -64,8 +80,8 @@ def _image_parts(path, label):
 def _ask(prompt, images=(), role="story-analysis"):
     if role == "narration" and images:
         raise ValueError("Narration must use beat notes, not panel images")
-    key = os.environ.get("GEMINI_API_KEY")
-    if not key:
+    keys = get_gemini_api_keys()
+    if not keys:
         raise RuntimeError("Story analysis needs GEMINI_API_KEY")
     parts = [{"text": prompt}]
     for label, path in images:
@@ -73,18 +89,27 @@ def _ask(prompt, images=(), role="story-analysis"):
             parts.extend(({"text": part_label}, {"inline_data": {"mime_type": "image/jpeg", "data": data}}))
     if sum(len(part.get("inline_data", {}).get("data", "")) for part in parts) > 18_000_000:
         raise ValueError("Panel images exceed Gemini's inline request limit; split the panel first")
-    for attempt in range(3):
+
+    max_attempts = 10
+    req_failures = 0
+    key_idx = 0
+    for attempt in range(max_attempts):
+        key = keys[key_idx % len(keys)]
+        model = STORY_MODELS[attempt % len(STORY_MODELS)]
         try:
             response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{STORY_MODEL}:generateContent",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 headers={"x-goog-api-key": key},
                 json={"system_instruction": {"parts": [{"text": _skill_text(role)}]},
                       "contents": [{"parts": parts}], "generationConfig": {"response_mime_type": "application/json"}},
                 timeout=(10, 120),
             )
         except requests.RequestException as exc:
-            if attempt == 2:
+            req_failures += 1
+            if req_failures >= 3:
                 raise RuntimeError(f"Gemini request failed after 3 attempts ({type(exc).__name__})") from exc
+            time.sleep(2 ** attempt)
+            continue
         else:
             if response.ok:
                 try:
@@ -93,7 +118,7 @@ def _ask(prompt, images=(), role="story-analysis"):
                         return result
                 except (KeyError, IndexError, ValueError):
                     pass
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     raise RuntimeError("Gemini returned invalid story JSON")
                 time.sleep(2 ** attempt)
                 continue
@@ -107,14 +132,39 @@ def _ask(prompt, images=(), role="story-analysis"):
                     except (ValueError, AttributeError, TypeError):
                         pass
                 delay = float(str(retry).rstrip("s")) if re.fullmatch(r"\d+(?:\.\d+)?s?", str(retry)) else 30 * 2 ** attempt
-                if attempt == 2 or delay > 120:
+                resp_text = getattr(response, "text", "") or ""
+                # If daily quota exhausted or long wait:
+                if delay > 120 or "quota" in resp_text.lower():
+                    # 1. First try failing over to secondary API key if available
+                    if len(keys) > 1 and key_idx < len(keys) - 1:
+                        key_idx += 1
+                        print(f"⏳ Gemini key quota exhausted on {model}; failing over to GEMINI_API_KEY{key_idx + 1}...", flush=True)
+                        time.sleep(1)
+                        continue
+                    # 2. Try rotating to the next available model
+                    if attempt < max_attempts - 1:
+                        next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
+                        print(f"⏳ Quota exhausted on {model} (wait {delay:.0f}s); switching model to {next_model}...", flush=True)
+                        time.sleep(2)
+                        continue
+                    raise RuntimeError(f"Gemini HTTP 429: rate limit or quota exhausted across all available keys and models. "
+                                       f"Saved chapter progress; retry later (suggested wait {delay:.0f}s).")
+                if attempt == max_attempts - 1:
                     raise RuntimeError(f"Gemini HTTP 429: rate limit or quota exhausted. "
                                        f"Saved chapter progress; retry later (suggested wait {delay:.0f}s).")
                 print(f"⏳ Gemini rate limit; retrying in {delay:.0f}s...", flush=True)
                 time.sleep(max(1, delay))
                 continue
-            if response.status_code not in (408, 500, 502, 503, 504) or attempt == 2:
-                raise RuntimeError(f"Gemini HTTP {response.status_code}")
+            if response.status_code in (408, 500, 502, 503, 504):
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(f"Gemini HTTP {response.status_code}")
+                delay = min(45, max(3, 2 ** (attempt + 1)))
+                next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
+                model_info = f" (switching to {next_model})" if next_model != model else ""
+                print(f"⏳ Gemini server busy/overloaded (HTTP {response.status_code}); retrying in {delay:.0f}s{model_info}...", flush=True)
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Gemini HTTP {response.status_code}")
         time.sleep(2 ** attempt)
 
 
@@ -242,7 +292,13 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
                 "OCR may contain errors, watermarks or missing words. Every panel image is attached and labeled. "
                 "For image_only panels, ignore OCR entirely and infer only what the image supports. "
                 "Use each image to verify actions, speakers and visual story changes; mark uncertainty. "
-                "Do not invent actions, identities or motives. Return JSON object {\"panels\": [one object per input "
+                "Do not invent actions, identities or motives. "
+                "CANONICAL NAME DISCIPLINE: Normalize all character names against Known characters. "
+                "Never adopt mangled OCR names or homophone corruptions ('fief' not 'thief', 'Saintess' not 'saintest'). "
+                "Attribute dialogue to specific known characters whenever visible; never label known characters as 'unidentified voice'. "
+                "FLASHBACK CROPS VS LIVE EVENTS: When a panel re-displays an earlier action (e.g. face touch, oath, falling), "
+                "explicitly label the beat as '[Flashback reflection]' rather than a new live physical action. "
+                "Return JSON object {\"panels\": [one object per input "
                 "panel with keys panel, beat, characters, new_threads, resolved_threads, timeline_event, "
                 "importance, needs_image]}. needs_image is true when a panel needs a closer visual check. "
                 "Bounds are fractional coordinates of that panel image; use null if unsure. "
@@ -356,16 +412,31 @@ def build_story_script(project_dir, chapter_id, panels, custom_prompt=None, stor
         batch = notes[start:start + 12]
         batch_plan = plan[start:start + 12]
         narration = _ask(
-            "You are a YouTube manhwa recap storyteller. Write voiceover from FACTS ONLY. You have no images. "
-            "Tell what happened and why it matters; never describe the picture or clothing. Use names only when confirmed. "
-            "Connect relevant earlier events. Keep one consistent dramatic conversational voice. Open with a hook only at chapter start, "
-            "end with a supported consequence or cliffhanger only at chapter end. Vary pace. Never invent events or motives. "
+            "You are an elite YouTube manhwa recap storyteller (in the viral style of top recap channels like AniStop and PlotArmor). "
+            "Write punchy voiceover from FACTS ONLY. You have no images. "
+            "Tell what happened, who is clashing, and why it matters in a sharp, conversational voice. "
+            "CRITICAL CHARACTER ROLES & NATURAL NAMING: Introduce the protagonist by canonical Story Bible name ONCE. "
+            "Afterward, PRIORITIZE natural pronouns (he/him/his) and short contextual descriptors. STRICTLY BAN repeating the clumsy full name across adjacent lines. "
+            "NO PING-PONG NAME DRUMMING: Do NOT alternate character names back-to-back ('Vera does X. Renee does Y. Vera says Z.'). Weave interactions using pronouns (he/she/they). "
+            "Cap monikers ('our boy', 'our guy', 'our protagonist') to at most once per batch for punchlines; NEVER spam them on consecutive lines. "
+            "NEVER call mentors, dying masters, enemies, or prologue figures 'our MC'—treat them as the veteran master or by canonical name. "
+            "Do NOT use meta announcements like 'Enter our actual MC'—weave character arrivals seamlessly into the narrative flow. "
+            "HOOK & PREMISE (0-15s): The opening lines MUST hook viewers with the CORE PREMISE + HIGH STAKES + ABSURD TWIST of the series. "
+            "BANNED: Do NOT copy prompt examples verbatim. Do NOT insert fake mid-scene rhetorical questions ('What is even happening?', 'A spar?'). "
+            "BANNED CRUTCHES: 'sweating bullets', 'cold sweat', 'before he can catch his breath', 'deadpan expression', 'internally screaming', 'every Tuesday', 'social suicide'. "
+            "NO BLUSH FATIGUE: Do NOT repeat 'blushes deeply/heavily' or 'cheeks flushing' repeatedly. Express romance through banter and subtle actions. "
+            "FLASHBACKS VS LIVE EVENTS: Never narrate a recurring memory crop as if the physical action is happening again right now. Frame it as reflection or omit. "
+            "NO SCREENPLAY DESCRIPTIVISM: Never describe camera frames, flowers entering frames, teacups clicking, doors closing, or decorative props. "
+            "NO META CAPTIONS: Never say 'A caption reminds us...' or 'An observer notes...'. State lore directly. "
+            "HOMOPHONE & GENRE LOCK: Use exact terms: 'fief' (NEVER 'thief'), 'Saintess' (NEVER 'saintest', 'saintis', 'saints'), 'Sir Knight' (NEVER 'Sir Night'), 'White Night' (NEVER 'white knight'), 'petals' (NEVER 'pedals'), 'deference' (NEVER 'difference'), 'courtier' (NEVER 'cordier'), 'concedes' (NEVER 'conceds'). "
+            "Genre accuracy: Use Murim terms (sect, inner qi, swordsman, vagrant); NEVER use 'Ronin' or modern corporate jargon. Zero name hallucinations. "
+            "Vary pace. Inject natural, scene-specific witty banter and kinetic action tension. "
             "Return JSON object: {\"lines\":[{\"panel\":1,\"text\":\"...\"},...]}. "
             "Provide exactly one short spoken line for each INCLUDE panel, and none for STORY_ONLY panels. "
             "Each line MUST fit its max_words and max_chars. Weave relevant STORY_ONLY facts into the next INCLUDE line. "
             "Give major events more space and make filler brief. Use reviewed OCR to preserve exact dialogue meaning, "
             "but treat analyst beats as the story facts; ignore watermarks and do not recite every bubble. "
-            f"Additional style instruction: {custom_prompt or 'dramatic, clear, fast'}\n"
+            f"Additional style instruction: {custom_prompt or 'witty, punchy, dramatic YouTube recap voice'}\n"
             f"Chapter position: panels {start + 1}-{start + len(batch)} of {len(notes)}. "
             f"Previous narrated lines: {json.dumps(list(by_panel.items())[-4:], ensure_ascii=False)}\n"
             f"Earlier beat notes: {json.dumps([note['beat'] for note in notes[max(0, start - 12):start]], ensure_ascii=False)}\n"
@@ -472,6 +543,10 @@ def polish_story_script(draft, notes, plan, bible, progress_path):
         outline = _ask(
             "Turn this section into a chronological CAUSAL STORY OUTLINE. Preserve each distinct argument, "
             "reply, confession, choice, revelation, and consequence. Combine decorative or repeated panels. "
+            "CANONICAL CHARACTER NAMES: Use exact names from the Story Bible (never mangled OCR names or homophones). "
+            "Attribute dialogue to the actual speaker. Fix OCR homophones ('fief' not 'thief', 'Saintess' not 'saintest'). "
+            "FLASHBACK / REPEATED PANELS: Combine decorative or cropped flashback panels into a single causal beat; "
+            "never outline a cropped memory panel as a new live physical event. "
             "State speakers only when clear. Omit physical appearance, poses, expressions, scenery, colors, "
             "sound effects, and credits. Do not invent motives or events. Return JSON "
             "{\"events\":[\"event 1\",\"event 2\"]}.\n"
@@ -491,14 +566,26 @@ def polish_story_script(draft, notes, plan, bible, progress_path):
     if not progress.get("story") and not progress.get("story_draft"):
         word_budget = max(120, int(sum(x["max_words"] for x in plan["panels"]) * 0.6))
         response = _ask(
-            "Write the complete chapter as one connected, spoken manhwa recap story. Begin from the previous "
-            "chapter's consequence when relevant; follow characters' choices, dialogue, causes and effects. "
-            "End with the chapter's real consequence. Use natural transitions, changing pace, and a conversational "
-            "recap voice like a story told aloud, not a panel tour. "
-            "Use confirmed names, relevant earlier story memory, and important dialogue meaning. "
-            "Ignore scanlation credits and watermarks; leave uncertain speakers unattributed. "
+            "Write the complete chapter as one connected, spoken manhwa recap story in the viral, entertaining style of top YouTube channels (AniStop, Manhwa Recap, PlotArmor). "
+            "CORE PREMISE HOOK (0-15s): The very first 1-2 sentences MUST hook the viewer with the CORE PREMISE + HIGH STAKES + ABSURD TWIST of the series. "
+            "NEVER open with dry clichés like 'It all begins when...' or 'Our story begins...'. Do NOT copy prompt examples verbatim. "
+            "CRITICAL MC IDENTIFICATION & NATURAL NAMING: Introduce the true Protagonist by canonical name ONCE. Afterward, PRIORITIZE natural pronouns (he/him/his) "
+            "and short situational descriptors. STRICTLY BAN repeating the clumsy full name in every sentence. "
+            "NO PING-PONG NAME DRUMMING: In dialogue or 1-on-1 scenes, NEVER alternate character names back-to-back ('Vera said... Renee replied... Vera wondered... Renee moved...'). Establish who is interacting once, then let natural pronouns (he/she) carry the rhythm. Only reintroduce names upon topic shifts, entrances, or location cuts. "
+            "Cap monikers ('our boy', 'our guy', 'our protagonist') to at most 1-2 times in the entire chapter, strictly for comedic punchlines. "
+            "NEVER call mentors, dying masters, enemies, or flashback figures 'our MC'—treat them as the legendary master or by canonical name. "
+            "Do NOT use meta announcements like 'Enter our actual MC'—weave arrivals seamlessly into the narrative flow. "
+            "HOMOPHONE & FANTASY DICTIONARY LOCK: Always use proper spelling: 'fief' (NEVER 'thief' for land/holdings), 'Saintess' (NEVER 'saintest', 'saintis', 'saints', 'Santa'), 'Sir Knight' (NEVER 'Sir Night'), 'White Night' (NEVER 'white knight' if referring to holy order/title), 'petals' (NEVER 'pedals'), 'deference' (NEVER 'difference'), 'courtier' (NEVER 'cordier'), 'adjutant' (NEVER 'agitant'), 'stirrup' (NEVER 'steerup'). "
+            "FLASHBACK CROPS VS LIVE EVENTS: Webtoon artists repeat cropped panels for emotional reflection. NEVER re-narrate a recurring flashback as if the physical action is happening again in live continuity! Frame it strictly as internal memory or omit. "
+            "NO META-NARRATIVE ARTIFACTS: NEVER write 'A caption reminds us...', 'An observer notes...', or 'The panel shows...'. Deliver world lore and actions with direct narrator authority. "
+            "NO BLUSH FATIGUE: Do NOT repeat 'blushing bright red', 'cheeks burning', or embarrassment clichés across multiple sentences. Convey connection through sharp dialogue and demeanor. "
+            "CLEAN PARALLEL TRANSITIONS: When cutting between parallel events or locations, use clean grounding markers ('Meanwhile, outside the hall...', 'Back at the estate...'). "
+            "BANNED CRUTCHES: 'sweating bullets', 'cold sweat', 'before he can catch his breath', 'deadpan expression', 'internally screaming', 'every Tuesday', 'social suicide'. "
+            "Deliver energetic fight commentary, dramatic stakes, and organic situational wit. "
+            "End with the chapter's real consequence, cliffhanger, or hype teaser. Use natural spoken transitions and varying pace. "
+            "Use confirmed names from Story Bible, relevant earlier story memory, and important dialogue meaning. "
             "Skip decorative or repeated beats. Never describe panels, images, poses, outfits, camera views, or OCR. "
-            "Do not invent events, dialogue, motives, or certainty. Write natural paragraphs, not panel notes or a list. "
+            "Do not invent events, fake motives, or certainty. Write natural, flowing spoken paragraphs, not panel notes or a list. "
             f"Cover every causal event in approximately {min(word_budget, len(progress['outline']) * 25)} to {word_budget} spoken words, without padding. "
             "Return JSON object {\"story\": \"...\"} with story as the complete prose narration.\n"
             f"Series memory: {json.dumps({'story_so_far': bible.get('rolling_summary', ''), 'earlier_chapters': [{'id': c['id'], 'summary': c.get('summary', [])} for c in bible.get('chapters', [])[-3:]], 'characters': [{'id': c['id'], 'name': c.get('name'), 'aliases': c.get('aliases', []), 'role': c.get('role'), 'relations': c.get('relations', {}), 'review': c.get('review', False)} for c in bible.get('characters', [])], 'open_threads': bible.get('open_threads', []), 'timeline': bible.get('timeline', [])[-12:]}, ensure_ascii=False)}\n"
@@ -521,15 +608,22 @@ def polish_story_script(draft, notes, plan, bible, progress_path):
         _save_json(progress_path, progress)
     if not progress.get("story_cleaned"):
         cleaned = _ask(
-            "Rewrite this draft as a person telling a friend the chapter's story. Keep the events, "
-            "causes, stakes, dialogue meaning, and uncertainty. Delete visual staging: what is shown, "
-            "poses, clothing, facial expressions, camera views, lighting, sound effects, and decorative actions. "
+            "Rewrite this draft as a person telling a friend the chapter's story with sharp YouTube recap flair. Keep the events, "
+            "causes, stakes, dialogue meaning, humor, and uncertainty. Ensure the protagonist is referred to with natural pronouns (he/him/his) "
+            "rather than repetitive full-name calling. Cap 'our boy' / 'our MC' to rare comedic moments. "
+            "PRUNE PING-PONG NAME DRUMMING: Smooth out back-and-forth name ping-pong ('Vera... Renee... Vera... Renee...') into natural pronoun flow (he/she). Names should only appear when necessary to resolve ambiguity. "
+            "FIX HOMOPHONES & OCR SLIPS: Replace 'thief' -> 'fief' when referring to territory/holdings; 'saintest/saintis/saints' -> 'Saintess'; 'white knight' -> 'White Night' (holy order/title); 'pedals' -> 'petals'; 'difference' -> 'deference'; 'agitant' -> 'adjutant'. "
+            "PRUNE REPEATED MEMORY LOOPS: If an action or beat (e.g., touching a face, falling, an oath) is narrated multiple times because of panel flashback crops, consolidate it into a single clean reference or frame it as a passing reflection. "
+            "BANISH META-CAPTIONS & OBSERVER TROPES: Remove 'A caption notes...', 'An observer reckons...', 'The narrator sees...'. State lore directly. "
+            "PRUNE BLUSH FATIGUE: Remove repeated blushing or flushing descriptions. "
+            "Preserve witty, self-aware narrator banter and kinetic action momentum without canned repetitive clichés ('sweating bullets', 'before he can catch his breath', 'deadpan'). "
+            "Delete visual staging: what is shown, poses, clothing, facial expressions, camera views, lighting, sound effects, and decorative actions. "
             "If a detail changes no event or relationship, omit it. Do not add facts. "
             "For example, 'A bloody hand appears against a dark backdrop' becomes 'His condition is worsening'; "
             "'A spoon dips into porridge' is omitted unless the meal changes the interaction. "
             "When a previous chapter exists, make the first sentence explicitly connect its ending to this "
             "chapter's first event. Do not begin with only a time skip. "
-            "Keep spoken sentences under 40 words. Write connected spoken paragraphs with natural transitions. "
+            "SENTENCE INTEGRITY & TTS CADENCE: Eliminate spliced or broken clauses. Keep spoken sentences under 40 words. Write connected spoken paragraphs with natural transitions and rhythm for TTS voiceover. "
             "Return JSON object {\"story\":\"...\"}.\n"
             f"Previous story: {bible.get('rolling_summary', '')}\n"
             f"Previous chapter: {json.dumps(bible.get('chapters', [])[-1:], ensure_ascii=False)}\n"

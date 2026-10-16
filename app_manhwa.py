@@ -49,7 +49,9 @@ def natural_sort_key(s):
 def process_manhwa_recap_project(
     source_input: str,
     project_name: str = None,
-    voice: str = "en-US-ChristopherNeural",
+    voice: str = "en-US-GuyNeural",
+    rate: str = "+0%",
+    pitch: str = "+0Hz",
     width: int = 1920,
     height: int = 1080,
     fps: int = 30,
@@ -64,6 +66,7 @@ def process_manhwa_recap_project(
     series_name: str = None,
     script_only: bool = False,
     all_panels: bool = True,
+    re_render: bool = False,
 ):
     """
     Main controller for the AI Manhwa Recap Production Pipeline.
@@ -125,7 +128,15 @@ def process_manhwa_recap_project(
     if state_mgr.is_step_completed("download"):
         print(f"⏩ [1/6] Step 'download' already COMPLETED (cached). Skipping.")
     else:
-        if source_input.startswith("http://") or source_input.startswith("https://"):
+        existing_raw = [
+            os.path.join(raw_images_dir, f)
+            for f in sorted(os.listdir(raw_images_dir), key=natural_sort_key)
+            if any(f.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"])
+        ]
+        if existing_raw and not force:
+            print(f"📦 Found {len(existing_raw)} existing chapter images in '{raw_images_dir}'. Using existing pages.")
+            raw_images = existing_raw
+        elif source_input.startswith("http://") or source_input.startswith("https://"):
             raw_images = download_webtoon_url(source_input, raw_images_dir)
             if not raw_images:
                 raise ValueError(f"Failed to download chapter images from URL: {source_input}")
@@ -505,17 +516,32 @@ def process_manhwa_recap_project(
     # -------------------------------------------------------------------------
     total_scenes = len(script_items)
     print(f"\n🎙️🎬 [5/6 & 6/6] Steps 'video_render': Multi-Mode Video Clip Rendering ({total_scenes} scenes, {workers} workers)...")
-    render_params = {"aspect": aspect, "voice": voice, "script": get_file_md5(script_json_path), "renderer": 2}
-    if state_mgr.is_step_completed("video_render", [final_video_path, master_audio_path], current_params=render_params):
+    render_params = {"aspect": aspect, "voice": voice, "rate": rate, "pitch": pitch, "script": get_file_md5(script_json_path), "renderer": 2}
+    if not re_render and state_mgr.is_step_completed("video_render", [final_video_path, master_audio_path], current_params=render_params):
         print(f"⏩ [5/6 & 6/6] Steps already COMPLETED (cached). Skipping.")
     else:
+        if re_render:
+            if os.path.exists(clips_dir):
+                for clip_f in os.listdir(clips_dir):
+                    if clip_f.endswith(".mp4"):
+                        try:
+                            os.remove(os.path.join(clips_dir, clip_f))
+                        except Exception:
+                            pass
+            if os.path.exists(audio_dir):
+                for aud_f in os.listdir(audio_dir):
+                    if aud_f.endswith(".mp3"):
+                        try:
+                            os.remove(os.path.join(audio_dir, aud_f))
+                        except Exception:
+                            pass
         def process_scene_clip(args):
             idx, item = args
             panel_num = item["panel"]
             img_path = item["image_path"]
             narrator_text = item["script"]
             framing_mode = item.get("framing_mode", "contain")
-            audio_key = hashlib.sha256(f"{voice}\0{narrator_text}".encode("utf-8")).hexdigest()[:12]
+            audio_key = hashlib.sha256(f"{voice}\0{rate}\0{pitch}\0{narrator_text}".encode("utf-8")).hexdigest()[:12]
             segment_audio_path = os.path.join(audio_dir, f"audio_{panel_num:03d}_{audio_key}.mp3")
             segment_video_path = os.path.join(clips_dir, f"clip_{panel_num:03d}.mp4")
             anim_preset = PRESETS[idx % len(PRESETS)]
@@ -523,7 +549,7 @@ def process_manhwa_recap_project(
             print(f"  ⚡ [Render Scene {panel_num}/{total_scenes}] Mode: {framing_mode} | Preset: {anim_preset}...", flush=True)
 
             # 1. Synthesize TTS
-            generate_page_tts(narrator_text, segment_audio_path, voice=voice)
+            generate_page_tts(narrator_text, segment_audio_path, voice=voice, rate=rate, pitch=pitch)
             audio_duration = get_audio_duration_sec(segment_audio_path)
             if audio_duration > min(25, item["target_sec"] + 5):
                 raise ValueError(f"Panel {panel_num} audio is {audio_duration:.1f}s, over its {item['target_sec']}s story budget")
@@ -608,7 +634,9 @@ def main():
     parser.add_argument("input", nargs="?", help="Manhwa chapter URL or path to local image directory / PDF file", default=None)
     parser.add_argument("--url", "--source", dest="source", help="Manhwa chapter URL or local folder/file path", default=None)
     parser.add_argument("-o", "-name", "--project-name", "--output", dest="project_name", help="Custom project folder name under output/", default=None)
-    parser.add_argument("-v", "--voice", help="Edge-TTS Narrator Voice (default: en-US-ChristopherNeural)", default="en-US-ChristopherNeural")
+    parser.add_argument("-v", "--voice", help="Edge-TTS Narrator Voice (default: en-US-GuyNeural)", default="en-US-GuyNeural")
+    parser.add_argument("--rate", help="TTS speech rate (e.g. +5%%, -4%%, default: +0%%)", default="+0%")
+    parser.add_argument("--pitch", help="TTS pitch (e.g. -2Hz, +2Hz, default: +0Hz)", default="+0Hz")
     parser.add_argument("--aspect", choices=["16:9", "9:16"], help="Video aspect ratio (default: 16:9 landscape)", default="16:9")
     parser.add_argument("-w", "--workers", type=int, help="Parallel processing threads (default: 8)", default=8)
     parser.add_argument("--mode", choices=["manhwa", "comic"], help="Recap style mode (default: manhwa)", default="manhwa")
@@ -620,10 +648,23 @@ def main():
     parser.add_argument("--prompt", help="Custom prompt instructions for script writer", default=None)
     parser.add_argument("--series", help="Store chapters and shared story memory under output/SERIES", default=None)
     parser.add_argument("--script-only", action="store_true", help="Write story and script, then stop before audio/video")
+    parser.add_argument("--re-render", dest="re_render", action="store_true", help="Re-render video clips and final video using existing script/audio")
     parser.add_argument("--all-panels", dest="all_panels", action="store_true", default=True, help="Preserve all approved video panels in recap video (default: True)")
     parser.add_argument("--compress-story", dest="all_panels", action="store_false", help="Compress recap down to 10-15 panels using condensed story summary")
 
-    args = parser.parse_args()
+    normalized_argv = []
+    i = 1
+    raw_argv = sys.argv
+    while i < len(raw_argv):
+        arg = raw_argv[i]
+        if arg in ("--pitch", "--rate") and i + 1 < len(raw_argv) and not raw_argv[i + 1].startswith("--"):
+            normalized_argv.append(f"{arg}={raw_argv[i + 1]}")
+            i += 2
+            continue
+        normalized_argv.append(arg)
+        i += 1
+
+    args = parser.parse_args(normalized_argv)
 
     source_input = args.input or args.source
     if not source_input:
@@ -634,6 +675,8 @@ def main():
             source_input=source_input.strip(),
             project_name=args.project_name,
             voice=args.voice,
+            rate=args.rate,
+            pitch=args.pitch,
             aspect=args.aspect,
             workers=args.workers,
             fps=args.fps,
@@ -646,6 +689,7 @@ def main():
             series_name=args.series,
             script_only=args.script_only,
             all_panels=args.all_panels,
+            re_render=args.re_render,
         )
     except Exception as e:
         print(f"\n❌ Error executing Manhwa Recap engine: {e}")

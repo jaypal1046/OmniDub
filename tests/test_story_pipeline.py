@@ -143,7 +143,7 @@ class StoryPipelineTest(unittest.TestCase):
 
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test"}), patch("core.story_pipeline.requests.post", return_value=Response()) as post:
             self.assertEqual(_ask("facts"), {"beat": "ok"})
-        self.assertIn("gemini-3.5-flash-lite", post.call_args.args[0])
+        self.assertIn("gemini-3.1-flash-lite", post.call_args.args[0])
         self.assertEqual(post.call_args.kwargs["headers"], {"x-goog-api-key": "test"})
         self.assertIn("story analyst", post.call_args.kwargs["json"]["system_instruction"]["parts"][0]["text"])
 

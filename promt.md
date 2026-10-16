@@ -40,3 +40,7 @@ Identify characters (present & flashback forms), important dialogue, causal narr
 Ground all observations in direct visual pixel inspection rather than raw OCR text alone.
 Save the structured results as data/antigravity_analysis.json.
 After confirming the analysis, run the production pipeline to render the video recap (FINAL_MANHWA_RECAP.mp4).
+
+
+
+python -u app_manhwa.py "https://vortexscans.org/series/the-novice's-frontline/chapter-1" -o he-novice-frontline-ch1 --series he-novice-frontline --aspect 16:9 --workers 4 -v "en-US-GuyNeural" --rate "+4%" --pitch "-2Hz" --re-render

@@ -56,7 +56,13 @@ def select_preset_for_beat(beat_type: str, framing_mode: str) -> str:
         return beat_presets.get(beat_type, "contain")
 
 
-def generate_page_tts(script_text: str, output_audio_path: str, voice: str = "en-US-ChristopherNeural") -> str:
+def generate_page_tts(
+    script_text: str,
+    output_audio_path: str,
+    voice: str = "en-US-GuyNeural",
+    rate: str = "+0%",
+    pitch: str = "+0Hz"
+) -> str:
     """
     Generates synthesized speech audio clip using edge-tts CLI.
     """
@@ -74,9 +80,15 @@ def generate_page_tts(script_text: str, output_audio_path: str, voice: str = "en
         "--text", clean_text,
         "--write-media", output_audio_path
     ]
+    if rate and rate != "+0%":
+        cmd.append(f"--rate={rate}")
+    if pitch and pitch != "+0Hz":
+        cmd.append(f"--pitch={pitch}")
+
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"⚠️ [TTS] edge-tts error ({exc}); falling back to Windows SAPI speech engine...", flush=True)
         import pythoncom
         import win32com.client
 

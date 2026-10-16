@@ -57,7 +57,7 @@ def clean_json_response(raw_text: str) -> Optional[dict]:
                 pass
     return None
 
-MODEL_CANDIDATES = ["gemini-3.5-flash-lite"]
+MODEL_CANDIDATES = ["gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash-lite"]
 
 _SELECTED_VISION_PROVIDER = None
 
