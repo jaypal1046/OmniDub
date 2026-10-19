@@ -18,7 +18,7 @@ from .comic_script import clean_json_response
 
 
 STORY_MODEL = "gemini-3.1-flash-lite"
-STORY_MODELS = [STORY_MODEL, "gemini-3.6-flash", "gemini-3.1-flash-lite-preview", "gemini-3.5-flash-lite"]
+STORY_MODELS = [STORY_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite-preview", "gemini-3.6-flash"]
 SPEAKING_WPM = 145
 PANEL_SECONDS = (4, 6, 9, 13)
 ANALYSIS_BATCH_SIZE = 6
@@ -91,7 +91,6 @@ def _ask(prompt, images=(), role="story-analysis"):
         raise ValueError("Panel images exceed Gemini's inline request limit; split the panel first")
 
     max_attempts = 10
-    req_failures = 0
     key_idx = 0
     for attempt in range(max_attempts):
         key = keys[key_idx % len(keys)]
@@ -102,13 +101,18 @@ def _ask(prompt, images=(), role="story-analysis"):
                 headers={"x-goog-api-key": key},
                 json={"system_instruction": {"parts": [{"text": _skill_text(role)}]},
                       "contents": [{"parts": parts}], "generationConfig": {"response_mime_type": "application/json"}},
-                timeout=(10, 120),
+                timeout=(15, 240),
             )
         except requests.RequestException as exc:
-            req_failures += 1
-            if req_failures >= 3:
-                raise RuntimeError(f"Gemini request failed after 3 attempts ({type(exc).__name__})") from exc
-            time.sleep(2 ** attempt)
+            delay = min(45, max(3, 2 ** (attempt + 1)))
+            next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
+            if len(keys) > 1 and (attempt + 1) % 2 == 0:
+                key_idx = (key_idx + 1) % len(keys)
+            key_info = f" (key #{key_idx + 1})" if len(keys) > 1 else ""
+            print(f"⏳ Gemini connection/timeout ({type(exc).__name__}) on {model}; retrying in {delay:.0f}s (switching to {next_model}{key_info})...", flush=True)
+            if attempt == max_attempts - 1:
+                raise RuntimeError(f"Gemini request failed after {max_attempts} attempts ({type(exc).__name__})") from exc
+            time.sleep(delay)
             continue
         else:
             if response.ok:
@@ -136,10 +140,10 @@ def _ask(prompt, images=(), role="story-analysis"):
                 # If daily quota exhausted or long wait:
                 if delay > 120 or "quota" in resp_text.lower():
                     # 1. First try failing over to secondary API key if available
-                    if len(keys) > 1 and key_idx < len(keys) - 1:
-                        key_idx += 1
+                    if len(keys) > 1 and attempt < max_attempts - 1:
+                        key_idx = (key_idx + 1) % len(keys)
                         print(f"⏳ Gemini key quota exhausted on {model}; failing over to GEMINI_API_KEY{key_idx + 1}...", flush=True)
-                        time.sleep(1)
+                        time.sleep(2)
                         continue
                     # 2. Try rotating to the next available model
                     if attempt < max_attempts - 1:
@@ -160,6 +164,8 @@ def _ask(prompt, images=(), role="story-analysis"):
                     raise RuntimeError(f"Gemini HTTP {response.status_code}")
                 delay = min(45, max(3, 2 ** (attempt + 1)))
                 next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
+                if len(keys) > 1 and (attempt + 1) % 3 == 0:
+                    key_idx = (key_idx + 1) % len(keys)
                 model_info = f" (switching to {next_model})" if next_model != model else ""
                 print(f"⏳ Gemini server busy/overloaded (HTTP {response.status_code}); retrying in {delay:.0f}s{model_info}...", flush=True)
                 time.sleep(delay)
@@ -169,11 +175,31 @@ def _ask(prompt, images=(), role="story-analysis"):
 
 
 def _save_json(path, value):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=os.path.dirname(path), delete=False) as out:
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dir_name, delete=False) as out:
         json.dump(value, out, indent=2, ensure_ascii=False)
         temporary = out.name
-    os.replace(temporary, path)
+    try:
+        # On Windows, os.replace can fail with [WinError 5] Access is denied
+        # if the destination file is momentarily locked by Windows Defender,
+        # indexing services, or IDE file watchers.
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                return
+            except (PermissionError, OSError):
+                time.sleep(0.05 * (attempt + 1))
+        # Fallback to direct write if rename remained locked
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, ensure_ascii=False)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except Exception:
+                pass
 
 
 def _reference_path(story_dir, look):

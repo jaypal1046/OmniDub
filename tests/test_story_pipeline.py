@@ -222,7 +222,7 @@ class StoryPipelineTest(unittest.TestCase):
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test"}), patch(
             "core.story_pipeline.requests.post", side_effect=requests.ReadTimeout("private details")
         ), patch("core.story_pipeline.time.sleep"):
-            with self.assertRaisesRegex(RuntimeError, "after 3 attempts \\(ReadTimeout\\)"):
+            with self.assertRaisesRegex(RuntimeError, "after 10 attempts \\(ReadTimeout\\)"):
                 _ask("facts")
 
     def test_resume_reuses_completed_narration_batch(self):
