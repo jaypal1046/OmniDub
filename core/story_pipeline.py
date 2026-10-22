@@ -40,6 +40,9 @@ def get_gemini_api_keys():
     return keys
 
 
+_KEY_ROTATION_COUNTER = 0
+
+
 def _skill_text(role):
     path = SKILLS_DIR / f"manhwa-{role}" / "SKILL.md"
     return path.read_text(encoding="utf-8").split("---", 2)[-1].strip()
@@ -91,7 +94,9 @@ def _ask(prompt, images=(), role="story-analysis"):
         raise ValueError("Panel images exceed Gemini's inline request limit; split the panel first")
 
     max_attempts = 10
-    key_idx = 0
+    global _KEY_ROTATION_COUNTER
+    key_idx = _KEY_ROTATION_COUNTER
+    _KEY_ROTATION_COUNTER += 1
     for attempt in range(max_attempts):
         key = keys[key_idx % len(keys)]
         model = STORY_MODELS[attempt % len(STORY_MODELS)]
@@ -106,7 +111,7 @@ def _ask(prompt, images=(), role="story-analysis"):
         except requests.RequestException as exc:
             delay = min(45, max(3, 2 ** (attempt + 1)))
             next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
-            if len(keys) > 1 and (attempt + 1) % 2 == 0:
+            if len(keys) > 1:
                 key_idx = (key_idx + 1) % len(keys)
             key_info = f" (key #{key_idx + 1})" if len(keys) > 1 else ""
             print(f"⏳ Gemini connection/timeout ({type(exc).__name__}) on {model}; retrying in {delay:.0f}s (switching to {next_model}{key_info})...", flush=True)
@@ -162,12 +167,15 @@ def _ask(prompt, images=(), role="story-analysis"):
             if response.status_code in (408, 500, 502, 503, 504):
                 if attempt == max_attempts - 1:
                     raise RuntimeError(f"Gemini HTTP {response.status_code}")
-                delay = min(45, max(3, 2 ** (attempt + 1)))
-                next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
-                if len(keys) > 1 and (attempt + 1) % 3 == 0:
+                # Immediately rotate key on server overload if multiple keys are available
+                if len(keys) > 1:
                     key_idx = (key_idx + 1) % len(keys)
+                next_model = STORY_MODELS[(attempt + 1) % len(STORY_MODELS)]
+                # First retry switches immediately (1.5s) to avoid unnecessary waiting
+                delay = 1.5 if attempt == 0 else min(30, max(2, 2 ** attempt))
+                key_info = f" (key #{key_idx + 1})" if len(keys) > 1 else ""
                 model_info = f" (switching to {next_model})" if next_model != model else ""
-                print(f"⏳ Gemini server busy/overloaded (HTTP {response.status_code}); retrying in {delay:.0f}s{model_info}...", flush=True)
+                print(f"⏳ Gemini server busy/overloaded (HTTP {response.status_code}); retrying in {delay:.1f}s{model_info}{key_info}...", flush=True)
                 time.sleep(delay)
                 continue
             raise RuntimeError(f"Gemini HTTP {response.status_code}")

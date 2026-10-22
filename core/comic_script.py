@@ -163,9 +163,14 @@ def call_openrouter_vision(system_instruction: str, mime_type: str, base64_data:
 
 def call_gemini_vision(system_instruction: str, mime_type: str, base64_data: str, api_key: Optional[str] = None) -> Optional[dict]:
     """Direct Google Gemini Vision call."""
-    if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    keys = []
+    if api_key and api_key.strip():
+        keys.append(api_key.strip())
+    for env_k in ("GEMINI_API_KEY", "GEMINI_API_KEY2"):
+        val = os.environ.get(env_k)
+        if val and val.strip() and val.strip() not in keys:
+            keys.append(val.strip())
+    if not keys:
         return None
 
     headers = {'Content-Type': 'application/json'}
@@ -189,20 +194,21 @@ def call_gemini_vision(system_instruction: str, mime_type: str, base64_data: str
         }
     }
 
-    for model in MODEL_CANDIDATES:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        try:
-            res = requests.post(url, headers=headers, json=payload, timeout=15)
-            if res.status_code == 200:
-                data = res.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                    parsed = clean_json_response(text_resp)
-                    if parsed and parsed.get("narrator_text"):
-                        return parsed
-        except Exception:
-            pass
+    for k in keys:
+        for model in MODEL_CANDIDATES:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={k}"
+            try:
+                res = requests.post(url, headers=headers, json=payload, timeout=15)
+                if res.status_code == 200:
+                    data = res.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        parsed = clean_json_response(text_resp)
+                        if parsed and parsed.get("narrator_text"):
+                            return parsed
+            except Exception:
+                pass
     return None
 
 
